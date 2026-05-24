@@ -86,8 +86,8 @@ BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', '0'))
 # owner requested. Alternatively, populate from an environment variable:
 #   WHITELISTED_GROUPS = set(int(g) for g in os.getenv('WHITELISTED_GROUPS', '').split(',') if g.strip())
 WHITELISTED_GROUPS: set[int] = {
-    -1002461611839
-    -1003393402791
+    -1002461611839,
+    -1003393402791,
 }
 
 # Subscription pricing tiers (amount in cents)
@@ -224,6 +224,9 @@ if not database_url:
     raise ValueError("DATABASE_URL not found in environment variables")
 
 connection_pool = None
+# Pool health-check throttle: only run SELECT 1 every N seconds (not on every call).
+_POOL_CHECK_INTERVAL = 30  # seconds
+_pool_last_check = [0.0]  # mutable container so we don't need a global statement
 
 
 def get_public_webapp_base_url():
@@ -270,8 +273,14 @@ def db_retry(func):
 
 def get_connection_pool():
     global connection_pool, database_url
-    # Fast path: test an existing connection pool without holding the creation lock.
+    # Fast path: return the existing pool if it was validated recently.
+    # Only run an actual health check (SELECT 1) every _POOL_CHECK_INTERVAL
+    # seconds to avoid a round-trip query on every database operation.
     if connection_pool:
+        now = time.time()
+        if now - _pool_last_check[0] < _POOL_CHECK_INTERVAL:
+            return connection_pool
+        # Time for a periodic health check
         try:
             conn = connection_pool.getconn()
             try:
@@ -279,6 +288,7 @@ def get_connection_pool():
                 cur.execute("SELECT 1")
                 cur.fetchone()
                 cur.close()
+                _pool_last_check[0] = now
                 return connection_pool
             finally:
                 connection_pool.putconn(conn)
@@ -511,6 +521,8 @@ def init_db():
         except Exception as e:
             logging.error(f"Error adding new columns: {e}")
             conn.rollback()
+            logging.warning("Database initialized with migration errors (non-critical columns may be missing)")
+            return True
         logging.info("Database initialized successfully")
         return True
 
@@ -1333,6 +1345,18 @@ def check_user_wallets():
                         # Auto-remove ONLY for token balance violations (never for NFT/trait)
                         if auto_remove and registration_mode in ["token", "both"] and not token_valid:
                             try:
+                                # Notify the user via DM before kicking
+                                try:
+                                    bot.send_message(
+                                        user_id,
+                                        f"⚠️ You have been removed from the group because your token balance "
+                                        f"({total_balance:,.2f}) fell below the required threshold "
+                                        f"({minimum_holding:,.2f}).\n\n"
+                                        f"Once your balance meets the requirement, you can re-register "
+                                        f"using the group's registration link.",
+                                    )
+                                except Exception as dm_e:
+                                    logging.debug(f"Could not DM user {user_id} before kick: {dm_e}")
                                 bot.kick_chat_member(group_id, user_id)
                                 with get_db_cursor() as (conn, cur):
                                     cur.execute("DELETE FROM user_wallets WHERE group_id = %s AND user_id = %s", (group_id, user_id))
@@ -1365,12 +1389,10 @@ def check_user_wallets():
                 if not auto_remove and below_users_to_alert:
                     user_list = []
                     for user_id, failure_desc in below_users_to_alert:
-                        try:
-                            user_info = bot.get_chat_member(group_id, user_id).user
-                            username = user_info.username or user_info.first_name or f"User{user_id}"
-                        except Exception as e:
-                            logging.error(f"Error retrieving info for user {user_id}: {e}")
-                            username = f"User{user_id}"
+                        # Use the username already stored in the DB to avoid
+                        # expensive per-user Telegram API calls.
+                        reg_match = next((r for r in user_regs if r["user_id"] == user_id), None)
+                        username = (reg_match["username"] if reg_match and reg_match.get("username") else f"User{user_id}")
                         user_list.append(f"*{username}*: {failure_desc}")
 
                     # Batch update the database for all users (reduces query count from N to 1)
@@ -1465,7 +1487,7 @@ def reminder_command(message):
     """Send a registration reminder with deep link to the group"""
     try:
         group_id = message.chat.id
-        bot_username = bot.get_me().username
+        bot_username = get_bot_username()
         reg_link = f"https://t.me/{bot_username}?start=register_{group_id}"
 
         # Create inline keyboard with registration button
@@ -1531,7 +1553,7 @@ def help_command(message):
 def config_command(message):
     # Create inline keyboard with private chat button
     markup = types.InlineKeyboardMarkup()
-    deep_link = f"https://t.me/{bot.get_me().username}?start=config_{message.chat.id}"
+    deep_link = f"https://t.me/{get_bot_username()}?start=config_{message.chat.id}"
     config_btn = types.InlineKeyboardButton("⚙️ Configure in Private Chat", url=deep_link)
     markup.add(config_btn)
 
@@ -1561,7 +1583,7 @@ def config_command(message):
 def votesetup_command(message):
     # Create inline keyboard with private chat button
     markup = types.InlineKeyboardMarkup()
-    deep_link = f"https://t.me/{bot.get_me().username}?start=votesetup_{message.chat.id}"
+    deep_link = f"https://t.me/{get_bot_username()}?start=votesetup_{message.chat.id}"
     votesetup_btn = types.InlineKeyboardButton("🗳️ Configure Voting in Private Chat", url=deep_link)
     markup.add(votesetup_btn)
 
@@ -2246,7 +2268,7 @@ def create_registration_link(group_id, send_to_chat_id=None):
 
     logging.info(f"Creating registration link for group ID: {group_id}")
     try:
-        bot_username = bot.get_me().username
+        bot_username = get_bot_username()
         reg_link = f"https://t.me/{bot_username}?start=register_{group_id}"
         try:
             chat_info = bot.get_chat(group_id)
@@ -3193,7 +3215,6 @@ def handle_poll_vote(call, poll_id, option_index):
                 config = SUBSCRIBER_CONFIGS.get(group_id, {})
             vote_duration = config.get("vote_duration", 3600)
 
-            import datetime
             if created_at:
                 # Convert created_at to datetime if it's a string
                 if isinstance(created_at, str):
@@ -3576,7 +3597,9 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None,
 def check_nft_ownership(addresses, collection_id, threshold):
     total_nft_count = get_user_nft_count(addresses, collection_id)
     if total_nft_count is None:
-        return False
+        # RPC failure — default to True to avoid false-negative rejections
+        # during outages (consistent with other safety checks in the codebase).
+        return True
     return total_nft_count >= threshold
 
 
@@ -4016,7 +4039,7 @@ def mywallets_command(message):
             # Redirect to private chat for security
             group_id = chat_id
             markup = types.InlineKeyboardMarkup()
-            deep_link = f"https://t.me/{bot.get_me().username}?start=mywallets_{group_id}"
+            deep_link = f"https://t.me/{get_bot_username()}?start=mywallets_{group_id}"
             mywallets_btn = types.InlineKeyboardButton("💰 View My Wallets in Private Chat", url=deep_link)
             markup.add(mywallets_btn)
 
@@ -4303,9 +4326,9 @@ def handle_chat_member_update(update):
 
                 logging.info(f"Sent registration reminder to new member {user_id} in group {group_id}")
 
-                # Auto-delete registration prompt after 5 minutes
+                # Auto-delete registration prompt after 15 minutes
                 def delete_welcome():
-                    time.sleep(300)  # 5 minutes
+                    time.sleep(900)  # 15 minutes
                     try:
                         bot.delete_message(group_id, sent_message.message_id)
                     except Exception as e:
@@ -4590,6 +4613,27 @@ def register_wallets(message):
     user_id = message.from_user.id
 
     if is_private:
+        # Check if user has a pending group context — redirect them helpfully
+        with get_db_cursor() as (conn, cur):
+            cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+        if row:
+            group_id = row[0]
+            try:
+                chat_obj = bot.get_chat(group_id)
+                group_name = chat_obj.title
+            except Exception:
+                group_name = f"Group {group_id}"
+            bot_username = get_bot_username()
+            reg_link = f"https://t.me/{bot_username}?start=register_{group_id}"
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=reg_link))
+            return bot.reply_to(
+                message,
+                f"ℹ️ To register for *{group_name}*, tap the button below:",
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
         return bot.reply_to(
             message,
             "ℹ️ Wallet registration is done in your group chat or via an invite link.\n\n"
@@ -6688,6 +6732,8 @@ if __name__ == "__main__":
         print(f"{BOT_NAME} is starting polling...")
         conflict_count = 0
         max_conflict_retries = 3
+        error_backoff = 60  # Initial backoff for non-409 errors (seconds)
+        max_error_backoff = 600  # Cap at 10 minutes
         while True:
             try:
                 logging.info("Bot polling started with none_stop=True.")
@@ -6698,6 +6744,7 @@ if __name__ == "__main__":
                     allowed_updates=None
                 )
                 conflict_count = 0  # Reset on successful polling
+                error_backoff = 60  # Reset backoff on success
             except telebot.apihelper.ApiTelegramException as api_e:
                 if "409" in str(api_e) or "Conflict" in str(api_e):
                     conflict_count += 1
@@ -6709,12 +6756,14 @@ if __name__ == "__main__":
                         logging.warning(f"409 Conflict detected (attempt {conflict_count}/{max_conflict_retries}). Retrying in 30 seconds...")
                         time.sleep(30)
                 else:
-                    logging.critical(f"Telegram API error in polling: {api_e}. Restarting in 60 seconds...")
-                    time.sleep(60)
+                    logging.critical(f"Telegram API error in polling: {api_e}. Restarting in {error_backoff} seconds...")
+                    time.sleep(error_backoff)
+                    error_backoff = min(error_backoff * 2, max_error_backoff)
             except Exception as e:
                 # This will only catch very critical errors that stop the polling loop entirely
-                logging.critical(f"CRITICAL ERROR in polling loop: {e}. Restarting polling in 60 seconds...")
-                time.sleep(60)
+                logging.critical(f"CRITICAL ERROR in polling loop: {e}. Restarting polling in {error_backoff} seconds...")
+                time.sleep(error_backoff)
+                error_backoff = min(error_backoff * 2, max_error_backoff)
 
 
     # Register bot commands for auto-completion
