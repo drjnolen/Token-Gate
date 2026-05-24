@@ -1349,7 +1349,7 @@ def check_user_wallets():
                                 try:
                                     bot.send_message(
                                         user_id,
-                                        f"⚠️ You have been removed from the group because your token balance "
+                                        f"⚠️ You are being removed from the group because your token balance "
                                         f"({total_balance:,.2f}) fell below the required threshold "
                                         f"({minimum_holding:,.2f}).\n\n"
                                         f"Once your balance meets the requirement, you can re-register "
@@ -1392,7 +1392,10 @@ def check_user_wallets():
                         # Use the username already stored in the DB to avoid
                         # expensive per-user Telegram API calls.
                         reg_match = next((r for r in user_regs if r["user_id"] == user_id), None)
-                        username = (reg_match["username"] if reg_match and reg_match.get("username") else f"User{user_id}")
+                        if reg_match and reg_match.get("username"):
+                            username = reg_match["username"]
+                        else:
+                            username = f"User{user_id}"
                         user_list.append(f"*{username}*: {failure_desc}")
 
                     # Batch update the database for all users (reduces query count from N to 1)
