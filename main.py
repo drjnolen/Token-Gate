@@ -27,8 +27,6 @@ import psutil
 import stripe
 from waitress import serve as waitress_serve
 
-# Note: get_user_nft_trait_count and get_user_nft_category_count are defined
-# later in this file (see the "NFT trait helpers" section around line 3600+).
 # ==================== Global Constants ===========================
 CACHE_TTL = 1200      # Cache Time-To-Live in seconds (20 minutes)
 VERIFICATION_CACHE_TTL = 60  # Freshness target for interactive verification checks
@@ -613,11 +611,6 @@ def update_config_in_db(chat_id, config):
         return True
 
 @db_retry
-def delete_config_from_db(chat_id):
-    with get_db_cursor() as (conn, cur):
-        cur.execute("DELETE FROM subscriber_configs WHERE chat_id=%s", (chat_id,))
-        return True
-
 def ensure_config_exists(group_id):
     """Ensure a group configuration exists, creating a default one if needed.
     
@@ -845,6 +838,7 @@ def get_group_subscription(group_id):
 def group_has_active_subscription(group_id):
     """Return True if the group has a non-expired subscription or is whitelisted."""
     if is_group_whitelisted(group_id):
+        logging.debug(f"Group {group_id} is whitelisted, bypassing subscription check.")
         return True
     sub = get_group_subscription(group_id)
     if sub and sub["expires_at"]:
@@ -852,7 +846,9 @@ def group_has_active_subscription(group_id):
         expires = sub["expires_at"]
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=datetime.timezone.utc)
-        return now < expires
+        if now < expires:
+            return True
+        logging.info(f"Group {group_id} subscription expired at {expires}.")
     return False
 
 @db_retry
@@ -1798,7 +1794,7 @@ def handle_private_config_callback(call):
         bot.answer_callback_query(call.id, "⏳ Processing…")
 
         # --- Subscription gate for config actions ---
-        if call.data.startswith("privconfig_") or call.data.startswith("config_"):
+        if call.data.startswith("privconfig_") or call.data.startswith("config_") or call.data.startswith("privvote_"):
             if not group_has_active_subscription(group_id):
                 try:
                     chat_obj = bot.get_chat(group_id)
@@ -2299,6 +2295,12 @@ def create_registration_link(group_id, send_to_chat_id=None):
 
 def show_subscription_prompt(chat_id, group_id, group_name):
     """Show subscription tier selection when group has no active subscription."""
+    # Safety-net: never show payment prompt for whitelisted groups.
+    if is_group_whitelisted(group_id):
+        logging.warning(f"show_subscription_prompt called for whitelisted group {group_id} — redirecting to config menu.")
+        show_config_menu_private(chat_id, group_id)
+        return
+
     sub = get_group_subscription(group_id)
     if sub and sub["expires_at"]:
         exp = sub["expires_at"]
@@ -2405,6 +2407,11 @@ def show_votesetup_menu_private(chat_id, group_id):
         except Exception as e:
             logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
+
+        # --- Subscription gate ---
+        if not group_has_active_subscription(group_id):
+            show_subscription_prompt(chat_id, group_id, group_name)
+            return
 
         # Store the group context for this user
         with get_db_cursor() as (conn, cur):
@@ -3606,7 +3613,7 @@ def check_nft_ownership(addresses, collection_id, threshold):
     return total_nft_count >= threshold
 
 
-# ── NFT trait helpers (override stubs from src.nft_traits) ──────────
+# ── NFT trait helpers ──────────────────────────────────────────────
 
 
 def _extract_traits(obj: dict) -> dict:
