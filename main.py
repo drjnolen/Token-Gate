@@ -119,6 +119,31 @@ INACTIVE_MEMBER_STATUS_MESSAGES = {
 _VERIFY_TOKEN_MAX_AGE = 600  # 10 minutes
 
 
+def encode_group_id_for_deeplink(group_id):
+    """Encode a group ID for use in Telegram deep link start parameters.
+
+    Telegram deep link parameters allow A-Z, a-z, 0-9, _ and - characters.
+    However, some Telegram clients may strip or mishandle the '-' character
+    (used for negative group IDs). This function replaces '-' with 'n' prefix
+    to ensure reliable delivery of negative group IDs.
+    """
+    group_id = int(group_id)
+    if group_id < 0:
+        return f"n{abs(group_id)}"
+    return str(group_id)
+
+
+def decode_group_id_from_deeplink(encoded):
+    """Decode a group ID from a Telegram deep link start parameter.
+
+    Handles both the new 'n'-prefixed encoding (for negative IDs) and the
+    legacy format where negative IDs used a literal '-' character.
+    """
+    if encoded.startswith("n"):
+        return -int(encoded[1:])
+    return int(encoded)
+
+
 def _generate_verify_token(group_id, user_id):
     """Create an HMAC-signed token proving a request originates from the /verify page.
 
@@ -1497,7 +1522,7 @@ def reminder_command(message):
     try:
         group_id = message.chat.id
         bot_username = get_bot_username()
-        reg_link = f"https://t.me/{bot_username}?start=register_{group_id}"
+        reg_link = f"https://t.me/{bot_username}?start=register_{encode_group_id_for_deeplink(group_id)}"
 
         # Create inline keyboard with registration button
         markup = types.InlineKeyboardMarkup()
@@ -1562,7 +1587,7 @@ def help_command(message):
 def config_command(message):
     # Create inline keyboard with private chat button
     markup = types.InlineKeyboardMarkup()
-    deep_link = f"https://t.me/{get_bot_username()}?start=config_{message.chat.id}"
+    deep_link = f"https://t.me/{get_bot_username()}?start=config_{encode_group_id_for_deeplink(message.chat.id)}"
     config_btn = types.InlineKeyboardButton("⚙️ Configure in Private Chat", url=deep_link)
     markup.add(config_btn)
 
@@ -1592,7 +1617,7 @@ def config_command(message):
 def votesetup_command(message):
     # Create inline keyboard with private chat button
     markup = types.InlineKeyboardMarkup()
-    deep_link = f"https://t.me/{get_bot_username()}?start=votesetup_{message.chat.id}"
+    deep_link = f"https://t.me/{get_bot_username()}?start=votesetup_{encode_group_id_for_deeplink(message.chat.id)}"
     votesetup_btn = types.InlineKeyboardButton("🗳️ Configure Voting in Private Chat", url=deep_link)
     markup.add(votesetup_btn)
 
@@ -2278,7 +2303,7 @@ def create_registration_link(group_id, send_to_chat_id=None):
     logging.info(f"Creating registration link for group ID: {group_id}")
     try:
         bot_username = get_bot_username()
-        reg_link = f"https://t.me/{bot_username}?start=register_{group_id}"
+        reg_link = f"https://t.me/{bot_username}?start=register_{encode_group_id_for_deeplink(group_id)}"
         try:
             chat_info = bot.get_chat(group_id)
             group_name = chat_info.title
@@ -4059,7 +4084,7 @@ def mywallets_command(message):
             # Redirect to private chat for security
             group_id = chat_id
             markup = types.InlineKeyboardMarkup()
-            deep_link = f"https://t.me/{get_bot_username()}?start=mywallets_{group_id}"
+            deep_link = f"https://t.me/{get_bot_username()}?start=mywallets_{encode_group_id_for_deeplink(group_id)}"
             mywallets_btn = types.InlineKeyboardButton("💰 View My Wallets in Private Chat", url=deep_link)
             markup.add(mywallets_btn)
 
@@ -4326,7 +4351,7 @@ def handle_chat_member_update(update):
                 # the register_ param), preventing accidental cross-registration
                 # if the message is seen by other group members.
                 _bot_username = get_bot_username()
-                reg_link = f"https://t.me/{_bot_username}?start=register_{group_id}"
+                reg_link = f"https://t.me/{_bot_username}?start=register_{encode_group_id_for_deeplink(group_id)}"
                 markup = types.InlineKeyboardMarkup()
                 register_btn = types.InlineKeyboardButton("✅ Verify Wallet", url=reg_link)
                 markup.add(register_btn)
@@ -4372,7 +4397,7 @@ def handle_start(message):
         if param.startswith("register_"):
             group_id_str = param[len("register_"):]
             try:
-                group_id = int(group_id_str)
+                group_id = decode_group_id_from_deeplink(group_id_str)
                 with get_db_cursor() as (conn, cur):
                     cur.execute("""
                         INSERT INTO pending_verifications (user_id, group_id, created_at)
@@ -4402,7 +4427,7 @@ def handle_start(message):
         elif param.startswith("config_"):
             group_id_str = param[len("config_"):]
             try:
-                group_id = int(group_id_str)
+                group_id = decode_group_id_from_deeplink(group_id_str)
 
                 # Check if user is admin of the group
                 try:
@@ -4423,7 +4448,7 @@ def handle_start(message):
         elif param.startswith("votesetup_"):
             group_id_str = param[len("votesetup_"):]
             try:
-                group_id = int(group_id_str)
+                group_id = decode_group_id_from_deeplink(group_id_str)
 
                 # Check if user is admin of the group
                 try:
@@ -4444,7 +4469,7 @@ def handle_start(message):
         elif param.startswith("mywallets_"):
             group_id_str = param[len("mywallets_"):]
             try:
-                group_id = int(group_id_str)
+                group_id = decode_group_id_from_deeplink(group_id_str)
 
                 # Store the group context for this user and then show wallets
                 with get_db_cursor() as (conn, cur):
@@ -4551,7 +4576,7 @@ def register_wallets(message):
             except Exception:
                 group_name = f"Group {group_id}"
             bot_username = get_bot_username()
-            reg_link = f"https://t.me/{bot_username}?start=register_{group_id}"
+            reg_link = f"https://t.me/{bot_username}?start=register_{encode_group_id_for_deeplink(group_id)}"
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=reg_link))
             return bot.reply_to(
@@ -4588,7 +4613,7 @@ def register_wallets(message):
     # own private verification session under their own Telegram ID.  This
     # prevents cross-registration if the group message is seen by other members.
     bot_username = get_bot_username()
-    reg_link = f"https://t.me/{bot_username}?start=register_{group_id}"
+    reg_link = f"https://t.me/{bot_username}?start=register_{encode_group_id_for_deeplink(group_id)}"
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=reg_link))
 
