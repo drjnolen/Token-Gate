@@ -4457,100 +4457,6 @@ def handle_start(message):
     else:
         bot.reply_to(message, "👋 Welcome to GuildSafe! Use /help to see available commands.")
 
-# New command handler for /confirm
-@db_retry
-@bot.message_handler(commands=['confirm'])
-def confirm_verification(message):
-    user_id = message.from_user.id
-
-    with get_db_cursor() as (conn, cur):
-        cur.execute("SELECT group_id, wallet_address, created_at FROM pending_verifications WHERE user_id = %s", (user_id,))
-        verification_data = cur.fetchone()
-
-    if not verification_data:
-        bot.reply_to(message, "❌ No pending wallet verification found.\n\nPlease use /register to start the verification process.")
-        return
-
-    group_id, wallet_address, timestamp = verification_data
-
-    if not wallet_address or not isinstance(wallet_address, str):
-        bot.reply_to(message, "❌ Invalid wallet address in verification data.\n\nPlease use /register to start the verification process again.")
-        with get_db_cursor() as (conn, cur):
-            cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
-        return
-
-    if not timestamp or time.time() - timestamp.timestamp() > VERIFICATION_TIMEOUT:
-        with get_db_cursor() as (conn, cur):
-            cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
-        bot.reply_to(message, "❌ Verification timed out.\n\nPlease use /register to start the verification process again.")
-        return
-
-    processing_msg = bot.reply_to(message, "⏳ Re-validating your on-chain token/NFT holdings...")
-
-    try:
-        with config_lock:
-            cfg = SUBSCRIBER_CONFIGS.get(group_id)
-        if not cfg:
-            bot.edit_message_text("❌ This group isn't set up yet. Ask an admin to run /gsconfig first.", chat_id=message.chat.id, message_id=processing_msg.message_id)
-            return
-
-        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
-        if not requirement_eval.get("requirements_met"):
-            error_text = "❌ *Wallet Requirements Not Met*\n\n" + "\n".join(requirement_eval.get("errors") or ["Please retry after updating your holdings."])
-            if requirement_eval.get("details"):
-                error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval.get("details", []))
-            bot.edit_message_text(
-                error_text,
-                chat_id=message.chat.id,
-                message_id=processing_msg.message_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        wallet_lower = wallet_address.lower()
-        success = save_wallet_for_user(group_id, user_id, message.from_user.username or message.from_user.first_name, [wallet_lower], replace_existing=False, registration_type=cfg.get("registration_mode", "token"))
-        if not success:
-            bot.edit_message_text("❌ Failed to save your wallet. Please try again later.", chat_id=message.chat.id, message_id=processing_msg.message_id)
-            return
-
-        try:
-            group_name = bot.get_chat(group_id).title
-        except Exception:
-            group_name = f"Group {group_id}"
-
-        text_lines = [
-            "✅ *Wallet Verification Successful!*",
-            "",
-            f"*Group:* {group_name}",
-            f"*Wallet:* `{wallet_address}`",
-        ]
-
-        if requirement_eval["details"]:
-            text_lines += ["", "📋 *Verification Details:*"] + requirement_eval["details"]
-
-        text_lines += ["", "Thank you for completing on-chain verification! You are now registered."]
-
-        if message.chat.type == 'private':
-            try:
-                invite = create_single_use_invite_link(group_id)
-                if invite:
-                    text_lines += ["", "*Group Invite Link:*", f"[Join {group_name}]({invite})", "_Use this link to join or return to the group._"]
-            except Exception as e:
-                logging.error(f"Error fetching invite link: {e}")
-            text_lines += ["", "💡 *Want to add another wallet?*", "Use `/register 0x123...abc` to add additional wallets to your account."]
-
-        bot.edit_message_text("\n".join(text_lines), chat_id=message.chat.id, message_id=processing_msg.message_id, parse_mode="Markdown", disable_web_page_preview=True)
-
-        with get_db_cursor() as (conn, cur):
-            cur.execute("UPDATE pending_verifications SET wallet_address = NULL, created_at = NOW() WHERE user_id = %s", (user_id,))
-
-    except Exception as e:
-        logging.error(f"Error during confirmation: {e}")
-        try:
-            bot.edit_message_text("❌ Error confirming verification. Please try again later.", chat_id=message.chat.id, message_id=processing_msg.message_id)
-        except Exception as inner_e:
-            logging.debug(f"Could not send error message to user {user_id}: {inner_e}")
-
 def build_wallet_connect_url(group_id, user_id, cfg=None):
     """Build a verification URL for the built-in Telegram mini-app.
 
@@ -6789,7 +6695,6 @@ if __name__ == "__main__":
                 telebot.types.BotCommand("reminder", "Send registration reminder (admins only)"),
                 telebot.types.BotCommand("exempt", "Exempt a user from wallet requirements (admins only)"),
                 telebot.types.BotCommand("addwallet", "Add wallet for a user by reply or user ID (admins only)"),
-                telebot.types.BotCommand("confirm", "Finalize pending wallet verification")
             ]
             bot.set_my_commands(commands)
             logging.info("Bot commands registered successfully")
