@@ -6,7 +6,6 @@ Handles /votesetup, /vote commands, poll creation, and vote callbacks.
 import json
 import logging
 import time
-import uuid
 import datetime
 
 from telebot import types

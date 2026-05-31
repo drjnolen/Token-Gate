@@ -26,7 +26,6 @@ import gc
 import psutil
 import stripe
 from waitress import serve as waitress_serve
-import jinja2
 
 # ==================== Refactored Module Imports ====================
 # Database operations are also available in db.py for new code.
