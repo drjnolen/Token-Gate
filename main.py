@@ -2297,7 +2297,7 @@ def show_subscription_prompt(chat_id, group_id, group_name):
     """Show subscription tier selection when group has no active subscription."""
     # Safety-net: never show payment prompt for whitelisted groups.
     if is_group_whitelisted(group_id):
-        logging.warning(f"show_subscription_prompt called for whitelisted group {group_id} — redirecting to config menu.")
+        logging.info(f"show_subscription_prompt called for whitelisted group {group_id} — redirecting to config menu.")
         show_config_menu_private(chat_id, group_id)
         return
 
