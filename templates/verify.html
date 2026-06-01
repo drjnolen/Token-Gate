@@ -984,8 +984,10 @@
         const bal = await suiRpc('suix_getBalance', [wallet, TOKEN_TYPE]);
         const raw = BigInt(bal.totalBalance || '0');
         const divisor = BigInt(Math.pow(10, DECIMALS));
-        // Use BigInt comparison for pass/fail to avoid floating-point precision issues
-        const thresholdRaw = BigInt(Math.round(MIN_HOLDING * Number(divisor)));
+        // Use BigInt comparison for pass/fail to avoid floating-point precision issues.
+        // MIN_HOLDING is a user-facing number (typically small); Math.floor ensures
+        // we never round up and accidentally reject a valid balance.
+        const thresholdRaw = BigInt(Math.floor(MIN_HOLDING * Number(divisor)));
         result.tokenOk = raw >= thresholdRaw;
         // Keep Number conversion only for display purposes
         const intPart = Number(raw / divisor);

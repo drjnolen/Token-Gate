@@ -3380,7 +3380,7 @@ def calculate_user_vote_weight(group_id, user_id):
             if nft_count is None:
                 logging.warning(f"NFT count RPC failed for user {user_id} in vote weight calc, using cached holdings")
                 cached = get_user_cached_holdings(group_id, user_id)
-                nft_count = (cached or {}).get("nft_count") or 0
+                nft_count = (cached or {}).get("nft_count", 0) or 0
             nft_votes = nft_count * votes_per_nft
             total_weight += nft_votes
 
