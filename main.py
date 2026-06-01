@@ -25,6 +25,7 @@ import datetime
 import gc
 import psutil
 import stripe
+from concurrent.futures import ThreadPoolExecutor
 from waitress import serve as waitress_serve
 
 # ==================== Refactored Module Imports ====================
@@ -226,6 +227,19 @@ def get_bot_username():
     if _BOT_USERNAME is None:
         _BOT_USERNAME = bot.get_me().username
     return _BOT_USERNAME
+
+# Lazily cached bot ID – populated on first call to get_bot_id().
+_BOT_ID = None
+
+def get_bot_id():
+    """Return the bot's Telegram user ID, caching it after the first API call."""
+    global _BOT_ID
+    if _BOT_ID is None:
+        _BOT_ID = bot.get_me().id
+    return _BOT_ID
+
+# Bounded thread pool for fire-and-forget cleanup tasks (e.g. delayed message deletion).
+_cleanup_executor = ThreadPoolExecutor(max_workers=4)
 
 
 def get_telegram_user_display_name(user):
@@ -533,6 +547,12 @@ def init_db():
                 activated_by BIGINT
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stripe_processed_events (
+                session_id TEXT PRIMARY KEY,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         try:
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS auto_remove BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_collection_id TEXT DEFAULT ''")
@@ -704,7 +724,7 @@ def save_wallet_for_user(group_id, user_id, username, wallet_list, is_exempt=Fal
                 if wallet.lower() not in existing_lower:
                     combined_wallets.append(wallet.lower())
                     existing_lower.append(wallet.lower())
-            combined_wallets.extend(existing_wallets)
+            combined_wallets.extend([w.lower() for w in existing_wallets])
             seen = set()
             combined_wallets = [w for w in combined_wallets if not (w.lower() in seen or seen.add(w.lower()))]
         else:
@@ -1217,9 +1237,14 @@ def check_group_holdings():
                 if alert_lines:
                     message = "🚨 *Low Token Holdings Alert*\n\n" + "\n".join(alert_lines)
                     try:
-                        bot.send_message(chat_id, message, parse_mode='Markdown')
+                        admins = bot.get_chat_administrators(chat_id)
+                        for admin in admins:
+                            try:
+                                bot.send_message(admin.user.id, message, parse_mode='Markdown')
+                            except Exception as admin_e:
+                                logging.debug(f"Failed to DM holdings alert to admin {admin.user.id}: {admin_e}")
                     except Exception as e:
-                        logging.error(f"Error sending alert to chat {chat_id}: {e}")
+                        logging.error(f"Error sending group holdings alert to admins for chat {chat_id}: {e}")
         except Exception as e:
             logging.error(f"Error in group holdings check: {e}")
         # Add jitter to prevent all groups checking at the same time
@@ -1645,6 +1670,10 @@ def votesetup_command(message):
 # Global dictionary to store poll creation context
 poll_creation_context = {}
 
+# Tracks which group an admin is currently configuring in private chat,
+# decoupling config sessions from the pending_verifications table.
+admin_config_context = {}
+
 @bot.message_handler(commands=['vote'])
 @admin_required
 def vote_command(message):
@@ -1661,7 +1690,7 @@ def vote_command(message):
     final_text = (
         f"{help_text}\n"
         "------\n"
-        "**To create the poll, reply directly to this message with the details in the format above.**"
+        "*To create the poll, reply directly to this message with the details in the format above.*"
     )
 
     # Store the original message thread ID for this poll creation
@@ -1793,24 +1822,24 @@ def handle_private_config_callback(call):
 
         elif call.data.startswith("config_"): # Handling for the old prefix
              parts = call.data.split("_")
-             # This assumes the group_id is not in the callback, which is how the old handler worked
-             # We will need to retrieve it from the user's context
-             with get_db_cursor() as (conn, cur):
-                cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (call.from_user.id,))
-                result = cur.fetchone()
-                if not result:
-                    bot.answer_callback_query(call.id, "❌ Group context lost. Please restart.")
-                    return
-                group_id = result[0]
+             # Retrieve group context from admin_config_context (preferred) or
+             # fall back to pending_verifications for backward compatibility.
+             group_id = admin_config_context.get(call.from_user.id)
+             if not group_id:
+                 with get_db_cursor() as (conn, cur):
+                    cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (call.from_user.id,))
+                    result = cur.fetchone()
+                    if not result:
+                        bot.answer_callback_query(call.id, "❌ Group context lost. Please restart.")
+                        return
+                    group_id = result[0]
              action = parts[1] if len(parts) > 1 else ""
 
-        else: # For mywallet_
-            parts = call.data.split("_")
-            if len(parts) < 3:
-                bot.answer_callback_query(call.id, "❌ Invalid wallet action.")
-                return
-            group_id = int(parts[1])
-            action = parts[2]
+        else:
+            # mywallet_ callbacks are handled by handle_mywallets_callback;
+            # this branch should never execute.
+            bot.answer_callback_query(call.id, "❌ Unrecognized action.")
+            return
 
         user_id = call.from_user.id
 
@@ -2382,7 +2411,8 @@ def show_config_menu_private(chat_id, group_id):
             show_subscription_prompt(chat_id, group_id, group_name)
             return
 
-        # Store the group context for this user
+        # Store the group context for this admin's config session
+        admin_config_context[chat_id] = group_id
         with get_db_cursor() as (conn, cur):
             cur.execute("""
                 INSERT INTO pending_verifications (user_id, group_id, created_at)
@@ -2448,7 +2478,8 @@ def show_votesetup_menu_private(chat_id, group_id):
             show_subscription_prompt(chat_id, group_id, group_name)
             return
 
-        # Store the group context for this user
+        # Store the group context for this admin's config session
+        admin_config_context[chat_id] = group_id
         with get_db_cursor() as (conn, cur):
             cur.execute("""
                 INSERT INTO pending_verifications (user_id, group_id, created_at)
@@ -2994,6 +3025,11 @@ def process_set_token_config(message, group_id):
         bot.send_message(message.chat.id, "❌ Invalid threshold or decimals value. Please ensure they are numbers.")
         return
 
+    # Validate SUI token type format: 0x<hex>::<module>::<Type>
+    if not re.match(r'^0x[0-9a-fA-F]+::\w+::\w+$', token):
+        bot.send_message(message.chat.id, "❌ Invalid token type format. Expected: `0x<address>::<module>::<Type>`", parse_mode="Markdown")
+        return
+
     with config_lock:
         ensure_config_exists(group_id)
         SUBSCRIBER_CONFIGS[group_id]['token'] = token
@@ -3342,8 +3378,9 @@ def calculate_user_vote_weight(group_id, user_id):
         if nft_collection_id and votes_per_nft > 0:
             nft_count = get_user_nft_count(wallet_addresses, nft_collection_id)
             if nft_count is None:
-                logging.warning(f"NFT count RPC failed for user {user_id} in vote weight calc, treating as 0")
-                nft_count = 0
+                logging.warning(f"NFT count RPC failed for user {user_id} in vote weight calc, using cached holdings")
+                cached = get_user_cached_holdings(group_id, user_id)
+                nft_count = (cached or {}).get("nft_count") or 0
             nft_votes = nft_count * votes_per_nft
             total_weight += nft_votes
 
@@ -4118,95 +4155,8 @@ def mywallets_command(message):
                 return
             group_id = result[0]
 
-        # Get user registration data
-        user_reg = get_user_registration(group_id, user_id)
-
-        if not user_reg:
-            bot.reply_to(message, "❌ You are not registered in this group. Use /register to register your wallet.")
-            return
-
-        if user_reg["is_exempt"]:
-            bot.reply_to(message, "✅ You are exempt from wallet requirements in this group.")
-            return
-
-        wallets = user_reg["wallets"]
-        if not wallets:
-            bot.reply_to(message, "❌ You have no registered wallets. Use /register to add a wallet.")
-            return
-
-        # Get group configuration for balance checking
-        with config_lock:
-            config = SUBSCRIBER_CONFIGS.get(group_id, {})
-
-        token = config.get("token", "")
-        decimals = config.get("decimals", 6)
-        minimum_holding = config.get("minimum_holding", 0)
-
-        # Show processing message
-        processing_msg = bot.reply_to(message, "⏳ Loading your wallet information...")
-
-        try:
-            # Fetch balances for all wallets
-            wallet_balances = {}
-            if token:
-                balances = fetch_wallet_balances(wallets, token, decimals)
-                wallet_balances = balances
-
-            # Build wallet information message
-            message_lines = [
-                "💰 *Your Registered Wallets*\n"
-            ]
-
-            total_balance = 0
-            for i, wallet in enumerate(wallets):
-                balance = wallet_balances.get(wallet.lower(), 0) or 0
-                total_balance += balance
-
-                # Truncate wallet address for display
-                display_wallet = f"{wallet[:8]}...{wallet[-6:]}"
-                status_emoji = "✅" if balance >= minimum_holding else "⚠️"
-
-                message_lines.append(f"{status_emoji} `{display_wallet}`")
-                if token:
-                    message_lines.append(f"    Balance: {balance:,.2f} tokens")
-                message_lines.append("")
-
-            if token:
-                threshold_status = "✅ Above" if total_balance >= minimum_holding else "❌ Below"
-                message_lines.append(f"*Total Balance:* {total_balance:,.2f} tokens")
-                message_lines.append(f"*Threshold Status:* {threshold_status} threshold ({minimum_holding:,.2f})")
-
-            # Create inline keyboard for wallet management
-            markup = types.InlineKeyboardMarkup()
-
-            # Add wallet management buttons
-            if len(wallets) > 1:
-                remove_btn = types.InlineKeyboardButton("🗑️ Remove Wallet", callback_data=f"mywallet_{group_id}_remove")
-                markup.add(remove_btn)
-
-            replace_btn = types.InlineKeyboardButton("🔄 Replace All Wallets", callback_data=f"mywallet_{group_id}_replace")
-            add_btn = types.InlineKeyboardButton("➕ Add Another Wallet", callback_data=f"mywallet_{group_id}_add")
-
-            markup.add(replace_btn)
-            markup.add(add_btn)
-
-            wallet_message = "\n".join(message_lines)
-
-            bot.edit_message_text(
-                wallet_message,
-                chat_id=message.chat.id,
-                message_id=processing_msg.message_id,
-                parse_mode="Markdown",
-                reply_markup=markup
-            )
-
-        except Exception as e:
-            logging.error(f"Error in mywallets command processing: {e}")
-            bot.edit_message_text(
-                "❌ Error loading wallet information. Please try again later.",
-                chat_id=message.chat.id,
-                message_id=processing_msg.message_id
-            )
+        # Use the full private wallet display which includes NFT/trait info
+        show_mywallets_private(chat_id, group_id)
 
     except Exception as e:
         logging.error(f"Error in mywallets command: {e}")
@@ -4269,7 +4219,7 @@ def handle_chat_member_update(update):
             user_name = update.new_chat_member.user.first_name
 
             # Skip if it's the bot itself
-            if user_id == bot.get_me().id:
+            if user_id == get_bot_id():
                 return
 
             logging.info(f"New member {user_name} ({user_id}) joined group {group_id}")
@@ -4372,14 +4322,14 @@ def handle_chat_member_update(update):
                 logging.info(f"Sent registration reminder to new member {user_id} in group {group_id}")
 
                 # Auto-delete registration prompt after 15 minutes
-                def delete_welcome():
+                def delete_welcome(gid=group_id, mid=sent_message.message_id):
                     time.sleep(900)  # 15 minutes
                     try:
-                        bot.delete_message(group_id, sent_message.message_id)
+                        bot.delete_message(gid, mid)
                     except Exception as e:
-                        logging.debug(f"Could not auto-delete welcome message in group {group_id}: {e}")
+                        logging.debug(f"Could not auto-delete welcome message in group {gid}: {e}")
 
-                threading.Thread(target=delete_welcome, daemon=True).start()
+                _cleanup_executor.submit(delete_welcome)
 
             except Exception as e:
                 logging.error(f"Error sending registration reminder to new member: {e}")
@@ -5036,12 +4986,16 @@ def api_verify():
             return _add_cors_headers(resp), 400
 
         if wallet_already_registered(wallet_address, group_id, user_id=tg_user_id):
-            try:
-                bot.send_message(tg_user_id, "⚠️ This wallet address is already registered to another user in this group.")
-            except Exception:
-                pass
             resp = jsonify({'success': False, 'error': 'Wallet already registered to another user in this group'})
-            return _add_cors_headers(resp), 409
+            cors_resp = _add_cors_headers(resp), 409
+            # Notify user in background to ensure CORS response is always returned promptly
+            def _notify_duplicate(uid=tg_user_id):
+                try:
+                    bot.send_message(uid, "⚠️ This wallet address is already registered to another user in this group.")
+                except Exception:
+                    pass
+            _cleanup_executor.submit(_notify_duplicate)
+            return cors_resp
 
         with config_lock:
             cfg = SUBSCRIBER_CONFIGS.get(group_id)
@@ -5184,6 +5138,16 @@ def stripe_webhook():
 
     if event.get("type") == "checkout.session.completed":
         session_data = event["data"]["object"]
+        stripe_session_id = session_data.get("id", "")
+
+        # Idempotency check: skip if this session was already processed
+        if stripe_session_id:
+            with get_db_cursor() as (conn, cur):
+                cur.execute("SELECT 1 FROM stripe_processed_events WHERE session_id = %s", (stripe_session_id,))
+                if cur.fetchone():
+                    logging.info(f"Stripe session {stripe_session_id} already processed, skipping")
+                    return jsonify({"status": "ok"})
+
         metadata = session_data.get("metadata", {})
         group_id_str = metadata.get("group_id")
         user_id_str = metadata.get("user_id")
@@ -5193,8 +5157,16 @@ def stripe_webhook():
             try:
                 group_id = int(group_id_str)
                 user_id = int(user_id_str) if user_id_str else 0
-                new_expiry = activate_subscription(group_id, session_data.get("id", ""), tier, user_id)
+                new_expiry = activate_subscription(group_id, stripe_session_id, tier, user_id)
                 logging.info(f"Stripe payment completed: group={group_id}, tier={tier}, expires={new_expiry}")
+
+                # Record this session as processed for idempotency
+                if stripe_session_id:
+                    with get_db_cursor() as (conn, cur):
+                        cur.execute(
+                            "INSERT INTO stripe_processed_events (session_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                            (stripe_session_id,),
+                        )
 
                 # Notify the user via Telegram
                 if user_id:
