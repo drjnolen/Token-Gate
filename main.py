@@ -1093,9 +1093,16 @@ def make_api_request_with_retry(request_callable, max_retries: int = 3, base_del
                 logging.error(f"API request failed after {max_retries} attempts: {e}")
                 raise
 
-            delay = base_delay * (2 ** attempt)
-            logging.warning(f"API request failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
-            time.sleep(delay)
+            # Honour Retry-After for HTTP 429 rate-limit responses.
+            response = getattr(e, 'response', None)
+            if response is not None and response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 30))
+                logging.warning(f"Rate limited (HTTP 429), retrying in {retry_after}s")
+                time.sleep(retry_after)
+            else:
+                delay = base_delay * (2 ** attempt)
+                logging.warning(f"API request failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
+                time.sleep(delay)
     raise last_exception
 
 
@@ -1142,6 +1149,7 @@ def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, 
         except Exception as e:
             logging.error(f"Failed to fetch on-chain balance for {wallet_lower}: {e}")
             results[wallet_lower] = None
+        time.sleep(0.05)  # Brief pause between wallets to avoid RPC burst traffic.
 
     if monitored_token == CITY_TOKEN_TYPE:
         for wallet_lower in list(results.keys()):
@@ -1210,49 +1218,6 @@ def _fetch_staked_city_balance(address: str, decimals: int) -> float | None:
 
 
 # ==================== Periodic Tasks ==============================
-def check_group_holdings():
-    while True:
-        try:
-            with config_lock:
-                configs = dict(SUBSCRIBER_CONFIGS)
-            for chat_id, config in configs.items():
-                token = config.get("token")
-                wallets = config.get("wallets", {})
-                minimum_holding = config.get("minimum_holding", 5000000)
-                decimals = config.get("decimals", 6)
-                if not token or not wallets:
-                    continue
-                addresses = [addr.lower() for addr in wallets.values()]
-                balances = fetch_wallet_balances(addresses, token, decimals)
-                alert_lines = []
-                for nickname, stored_address in wallets.items():
-                    norm_addr = stored_address.lower()
-                    balance = balances.get(norm_addr)
-                    if balance is None:
-                        logging.info(f"Skipping alert for {nickname} due to missing data for {norm_addr} (API error)")
-                        continue
-                    # Include zero balances as valid data
-                    if balance < minimum_holding:
-                        alert_lines.append(f"*{nickname}*: {balance:,.2f} tokens (Below threshold)")
-                if alert_lines:
-                    message = "🚨 *Low Token Holdings Alert*\n\n" + "\n".join(alert_lines)
-                    try:
-                        admins = bot.get_chat_administrators(chat_id)
-                        for admin in admins:
-                            try:
-                                bot.send_message(admin.user.id, message, parse_mode='Markdown')
-                            except Exception as admin_e:
-                                logging.debug(f"Failed to DM holdings alert to admin {admin.user.id}: {admin_e}")
-                    except Exception as e:
-                        logging.error(f"Error sending group holdings alert to admins for chat {chat_id}: {e}")
-        except Exception as e:
-            logging.error(f"Error in group holdings check: {e}")
-        # Add jitter to prevent all groups checking at the same time
-        jitter = SLEEP_BETWEEN_TASKS * TASK_JITTER_PERCENT * (2 * random.random() - 1)
-        sleep_time = SLEEP_BETWEEN_TASKS + jitter
-        logging.info(f"Next group holdings check in {sleep_time:.0f}s (base: {SLEEP_BETWEEN_TASKS}s, jitter: {jitter:+.0f}s)")
-        time.sleep(sleep_time)
-
 def check_user_wallets():
     """
     Efficiently checks all user wallets for a group in a single batch operation
@@ -1346,8 +1311,18 @@ def check_user_wallets():
                     user_nft_count = None
                     user_trait_count = None
                     if registration_mode in ["nft", "both"] and nft_collection_id:
+                        fetched_nfts = None
                         try:
-                            user_nft_count = get_user_nft_count(user_wallets_lower, nft_collection_id)
+                            if nft_trait_name:
+                                # Fetch once with content so traits can be extracted from the
+                                # same result set, avoiding a second RPC round-trip.
+                                fetched_nfts = _fetch_owned_nfts(
+                                    user_wallets_lower, nft_collection_id, show_content=True
+                                )
+                                user_nft_count = len(fetched_nfts)
+                            else:
+                                user_nft_count = get_user_nft_count(user_wallets_lower, nft_collection_id)
+
                             if user_nft_count is None:
                                 logging.warning(f"Skipping NFT check for user {user_id} in group {group_id} due to API failure.")
                                 nft_valid = True  # Safety: don't penalize on API failure
@@ -1360,14 +1335,30 @@ def check_user_wallets():
                         # Check trait requirements if configured and NFT collection check passed
                         if nft_valid and nft_trait_name:
                             try:
-                                if nft_trait_value:
-                                    user_trait_count = get_user_nft_trait_count(
-                                        user_wallets_lower, nft_collection_id, nft_trait_name, nft_trait_value
-                                    )
+                                if fetched_nfts is not None:
+                                    # Re-use already-fetched NFT objects; no second RPC call.
+                                    target_key = nft_trait_name.strip().lower()
+                                    if nft_trait_value:
+                                        target_val = nft_trait_value.strip().lower()
+                                        user_trait_count = sum(
+                                            1 for obj in fetched_nfts
+                                            if _extract_traits(obj).get(target_key) == target_val
+                                        )
+                                    else:
+                                        user_trait_count = sum(
+                                            1 for obj in fetched_nfts
+                                            if target_key in _extract_traits(obj)
+                                        )
                                 else:
-                                    user_trait_count = get_user_nft_category_count(
-                                        user_wallets_lower, nft_collection_id, nft_trait_name
-                                    )
+                                    # Fetch failed earlier; fall back to individual helpers.
+                                    if nft_trait_value:
+                                        user_trait_count = get_user_nft_trait_count(
+                                            user_wallets_lower, nft_collection_id, nft_trait_name, nft_trait_value
+                                        )
+                                    else:
+                                        user_trait_count = get_user_nft_category_count(
+                                            user_wallets_lower, nft_collection_id, nft_trait_name
+                                        )
                                 if user_trait_count is not None and user_trait_count < nft_trait_threshold:
                                     trait_valid = False
                                     logging.info(f"User {user_id} fails trait check: {user_trait_count} < {nft_trait_threshold}")
@@ -1482,6 +1473,9 @@ def check_user_wallets():
                                 logging.error(f"Failed to send alert to admin {admin.user.id}: {admin_e}")
                     except Exception as e:
                         logging.error(f"Error sending low balance alerts to admins for group {group_id}: {e}")
+
+                # Brief pause between groups to give the RPC endpoint breathing room.
+                time.sleep(2)
 
         except Exception as e:
             logging.error(f"Error in user wallets check: {e}")
@@ -5385,10 +5379,6 @@ if __name__ == "__main__":
     )
     flask_thread.daemon = True
     flask_thread.start()
-
-    group_holdings_thread = threading.Thread(target=check_group_holdings)
-    group_holdings_thread.daemon = True
-    group_holdings_thread.start()
 
     user_wallets_thread = threading.Thread(target=check_user_wallets)
     user_wallets_thread.daemon = True
