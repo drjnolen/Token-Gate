@@ -54,6 +54,8 @@ NFT_RPC_RETRY_DELAY = 2  # Seconds to wait before retrying an NFT RPC check
 DB_POOL_MIN = int(os.getenv('DB_POOL_MIN', '5'))  # Minimum database connections
 DB_POOL_MAX = int(os.getenv('DB_POOL_MAX', '15'))  # Maximum database connections
 TASK_JITTER_PERCENT = 0.1  # Add ±10% jitter to task intervals to prevent thundering herd
+WALLET_FETCH_DELAY = 0.05  # Seconds between per-wallet RPC calls to avoid burst traffic
+GROUP_CHECK_DELAY = 2     # Seconds between group checks to give the RPC endpoint breathing room
 
 # ==================== Logging Setup ==============================
 file_handler = RotatingFileHandler("bot.log", maxBytes=5 * 1024 * 1024, backupCount=5)
@@ -1096,7 +1098,10 @@ def make_api_request_with_retry(request_callable, max_retries: int = 3, base_del
             # Honour Retry-After for HTTP 429 rate-limit responses.
             response = getattr(e, 'response', None)
             if response is not None and response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', 30))
+                try:
+                    retry_after = int(response.headers.get('Retry-After', 30))
+                except (ValueError, TypeError):
+                    retry_after = 30
                 logging.warning(f"Rate limited (HTTP 429), retrying in {retry_after}s")
                 time.sleep(retry_after)
             else:
@@ -1149,7 +1154,7 @@ def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, 
         except Exception as e:
             logging.error(f"Failed to fetch on-chain balance for {wallet_lower}: {e}")
             results[wallet_lower] = None
-        time.sleep(0.05)  # Brief pause between wallets to avoid RPC burst traffic.
+        time.sleep(WALLET_FETCH_DELAY)  # Brief pause between wallets to avoid RPC burst traffic.
 
     if monitored_token == CITY_TOKEN_TYPE:
         for wallet_lower in list(results.keys()):
@@ -1475,7 +1480,7 @@ def check_user_wallets():
                         logging.error(f"Error sending low balance alerts to admins for group {group_id}: {e}")
 
                 # Brief pause between groups to give the RPC endpoint breathing room.
-                time.sleep(2)
+                time.sleep(GROUP_CHECK_DELAY)
 
         except Exception as e:
             logging.error(f"Error in user wallets check: {e}")
