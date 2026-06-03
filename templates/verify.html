@@ -331,18 +331,18 @@
   }
 
   /* ── Configuration from query params (server-injected) ── */
-  const GROUP_ID        = {{ js_group_id }};
-  const TG_USER_ID      = {{ js_tg_user_id }};
-  const SUI_RPC         = {{ js_sui_rpc }};
-  const TOKEN_TYPE      = {{ js_token_type }};
-  const REQUIRED_BAL    = {{ safe_required_balance }};
-  const DECIMALS        = {{ safe_decimals }};
-  const MIN_HOLDING     = {{ safe_minimum_holding }};
-  const REG_MODE        = {{ js_reg_mode }};
-  const NFT_COLLECTION  = {{ js_nft_collection }};
-  const NFT_THRESHOLD   = {{ safe_nft_threshold }};
-  const API_VERIFY_URL  = {{ js_api_verify_url }};
-  const VERIFY_TOKEN   = {{ js_verify_token }};
+  const GROUP_ID        = {{ js_group_id|safe }};
+  const TG_USER_ID      = {{ js_tg_user_id|safe }};
+  const SUI_RPC         = {{ js_sui_rpc|safe }};
+  const TOKEN_TYPE      = {{ js_token_type|safe }};
+  const REQUIRED_BAL    = {{ safe_required_balance|safe }};
+  const DECIMALS        = {{ safe_decimals|safe }};
+  const MIN_HOLDING     = {{ safe_minimum_holding|safe }};
+  const REG_MODE        = {{ js_reg_mode|safe }};
+  const NFT_COLLECTION  = {{ js_nft_collection|safe }};
+  const NFT_THRESHOLD   = {{ safe_nft_threshold|safe }};
+  const API_VERIFY_URL  = {{ js_api_verify_url|safe }};
+  const VERIFY_TOKEN   = {{ js_verify_token|safe }};
 
   /* ── State ── */
   let connectedAddress = '';
