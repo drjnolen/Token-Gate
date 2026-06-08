@@ -1085,14 +1085,16 @@
         // 2) Also check NFTs inside SUI Kiosks
         if (count < MAX_NFT_ENUMERATE) {
           $status.textContent = 'Checking Kiosk NFTs…';
-          $fill.style.width = '70%';
+          $fill.style.width = '65%';
           const KIOSK_CAP_TYPE = '0x0000000000000000000000000000000000000000000000000000000000000002::kiosk::KioskOwnerCap';
+          const PERSONAL_CAP_SUFFIX = '::personal_kiosk::PersonalKioskCap';
           const capQuery = {
             filter: { StructType: KIOSK_CAP_TYPE },
             options: { showType: true, showContent: true }
           };
-          // Find all KioskOwnerCap objects to get Kiosk IDs
+          // 2a) Find all standard KioskOwnerCap objects to get Kiosk IDs
           const kioskIds = [];
+          const seenKioskIds = new Set();
           let capCursor = null;
           do {
             const capPage = await suiRpc('suix_getOwnedObjects', [wallet, capQuery, capCursor, 50]);
@@ -1101,12 +1103,72 @@
               const capObj = ci.data || {};
               const capFields = ((capObj.content || {}).fields) || {};
               const kioskId = capFields['for'];
-              if (kioskId) kioskIds.push(kioskId);
+              if (kioskId && !seenKioskIds.has(kioskId)) {
+                seenKioskIds.add(kioskId);
+                kioskIds.push(kioskId);
+              }
             }
             capCursor = capPage.hasNextPage ? capPage.nextCursor : null;
           } while (capCursor);
 
-          // Enumerate each Kiosk's items via dynamic fields
+          // 2b) Scan for PersonalKioskCap objects (used by collections like
+          // PrimeMachin and EMP that enforce personal-kiosk transfer policies).
+          // Pass 1: lightweight type-only scan to find PersonalKioskCap object IDs.
+          $status.textContent = 'Checking Personal Kiosk NFTs…';
+          $fill.style.width = '70%';
+          try {
+            const personalCapIds = [];
+            const scanQuery = { options: { showType: true } };
+            let scanCursor = null;
+            do {
+              const scanPage = await suiRpc('suix_getOwnedObjects', [wallet, scanQuery, scanCursor, 50]);
+              const scanItems = scanPage.data || [];
+              for (const si of scanItems) {
+                const sObj = si.data || {};
+                const sType = sObj.type || '';
+                if (sType.endsWith(PERSONAL_CAP_SUFFIX)) {
+                  const sId = sObj.objectId;
+                  if (sId) personalCapIds.push(sId);
+                }
+              }
+              scanCursor = scanPage.hasNextPage ? scanPage.nextCursor : null;
+            } while (scanCursor);
+
+            // Pass 2: fetch content for each PersonalKioskCap to extract kiosk ID
+            for (const pcId of personalCapIds) {
+              try {
+                const pcObj = await suiRpc('sui_getObject', [pcId, { showType: true, showContent: true }]);
+                if (pcObj && pcObj.data) {
+                  const pcFields = ((pcObj.data.content || {}).fields) || {};
+                  const pcCap = pcFields.cap;
+                  let pkKioskId = null;
+                  if (pcCap && typeof pcCap === 'object') {
+                    const pcCapFields = pcCap.fields || {};
+                    // Direct KioskOwnerCap (Mysten extension style)
+                    pkKioskId = pcCapFields['for'] || null;
+                    // Option<KioskOwnerCap> (OriginByte style) — unwrap vector
+                    if (!pkKioskId && Array.isArray(pcCapFields.vec) && pcCapFields.vec.length > 0) {
+                      const inner = pcCapFields.vec[0];
+                      if (inner && typeof inner === 'object') {
+                        pkKioskId = (inner.fields || inner)['for'] || null;
+                      }
+                    }
+                  }
+                  if (pkKioskId && !seenKioskIds.has(pkKioskId)) {
+                    seenKioskIds.add(pkKioskId);
+                    kioskIds.push(pkKioskId);
+                  }
+                }
+              } catch (_pcErr) {
+                console.warn('Error fetching PersonalKioskCap', pcId, _pcErr);
+              }
+            }
+          } catch (_scanErr) {
+            console.warn('PersonalKioskCap scan error:', _scanErr);
+          }
+
+          // 2c) Enumerate each Kiosk's items via dynamic fields
+          $fill.style.width = '75%';
           for (let ki = 0; ki < kioskIds.length && count < MAX_NFT_ENUMERATE; ki++) {
             try {
               let dfCursor = null;
@@ -1213,7 +1275,7 @@
     try {
       check = await Promise.race([
         verifyOnChain(wallet),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 30000))
       ]);
     } catch (err) {
       if (err.message === 'timeout') {

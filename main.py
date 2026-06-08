@@ -3456,6 +3456,127 @@ _KIOSK_OWNER_CAP_TYPE = (
     "::kiosk::KioskOwnerCap"
 )
 
+# Suffix used to detect Personal Kiosk Caps, which wrap a KioskOwnerCap
+# inside a soulbound object.  The package address varies across deployments
+# (Mysten's official extension, OriginByte's ob_kiosk, etc.), so we match
+# by suffix rather than exact type to stay robust against upgrades.
+_PERSONAL_KIOSK_CAP_SUFFIX = "::personal_kiosk::PersonalKioskCap"
+
+
+def _extract_kiosk_id_from_personal_cap(obj: dict) -> str | None:
+    """Extract the Kiosk object ID from a ``PersonalKioskCap`` object.
+
+    ``PersonalKioskCap`` wraps a ``KioskOwnerCap`` which has a ``for`` field
+    pointing to the Kiosk ID.  Different implementations store the cap
+    differently:
+
+    * **Mysten extension** – ``cap`` is a direct ``KioskOwnerCap`` value:
+      ``content.fields.cap.fields.for``
+    * **OriginByte ob_kiosk** – ``cap`` is ``Option<KioskOwnerCap>``
+      (serialised as a Move ``vector``):
+      ``content.fields.cap.fields.vec[0].fields.for``
+
+    Returns the kiosk ID string or ``None`` if extraction fails.
+    """
+    content = obj.get("content") or {}
+    fields = content.get("fields") or {}
+    cap = fields.get("cap")
+    if not isinstance(cap, dict):
+        return None
+
+    cap_fields = cap.get("fields") or {}
+
+    # Direct KioskOwnerCap (Mysten extension style)
+    kiosk_id = cap_fields.get("for")
+    if kiosk_id:
+        return kiosk_id
+
+    # Option<KioskOwnerCap> (OriginByte style) – unwrap the vector
+    vec = cap_fields.get("vec")
+    if isinstance(vec, list) and len(vec) > 0:
+        inner = vec[0]
+        if isinstance(inner, dict):
+            inner_fields = inner.get("fields") or inner
+            kiosk_id = inner_fields.get("for")
+            if kiosk_id:
+                return kiosk_id
+
+    # Fallback: try to find ``for`` anywhere in nested cap structure
+    # (handles any unexpected wrapping layers)
+    if isinstance(cap_fields, dict):
+        for _key, val in cap_fields.items():
+            if _key == "for" and isinstance(val, str):
+                return val
+            if isinstance(val, dict):
+                nested_for = (val.get("fields") or val).get("for")
+                if nested_for and isinstance(nested_for, str):
+                    return nested_for
+
+    return None
+
+
+def _fetch_personal_kiosk_ids(owner: str, max_retries: int = 2) -> list[str]:
+    """Discover Kiosk IDs from ``PersonalKioskCap`` objects owned by *owner*.
+
+    Since the ``PersonalKioskCap`` type lives in a non-framework package whose
+    address can vary, we cannot use a ``StructType`` filter.  Instead:
+
+    1. **Type-only scan** – paginate through all owned objects with
+       ``showType: True`` only (cheap) and collect object IDs whose type
+       ends with ``::personal_kiosk::PersonalKioskCap``.
+    2. **Content fetch** – for each matching object, call ``sui_getObject``
+       with ``showContent: True`` to extract the wrapped kiosk ID.
+
+    Returns a (possibly empty) list of Kiosk object IDs.
+    """
+    # Pass 1: lightweight type-only scan for PersonalKioskCap objects
+    personal_cap_ids = []
+    scan_query = {"options": {"showType": True}}
+    cursor = None
+    while True:
+        rpc_result = sui_rpc_request(
+            "suix_getOwnedObjects",
+            [owner, scan_query, cursor, 50],
+            max_retries=max_retries,
+        )
+        data = rpc_result.get("data", []) if rpc_result else []
+        for item in data:
+            obj = item.get("data", {})
+            obj_type = obj.get("type") or ""
+            if obj_type.endswith(_PERSONAL_KIOSK_CAP_SUFFIX):
+                oid = obj.get("objectId")
+                if oid:
+                    personal_cap_ids.append(oid)
+        if not rpc_result or not rpc_result.get("hasNextPage"):
+            break
+        cursor = rpc_result.get("nextCursor")
+
+    if not personal_cap_ids:
+        return []
+
+    # Pass 2: fetch content for each PersonalKioskCap to extract kiosk IDs
+    kiosk_ids = []
+    for cap_id in personal_cap_ids:
+        try:
+            obj_resp = sui_rpc_request(
+                "sui_getObject",
+                [cap_id, {"showType": True, "showContent": True}],
+                max_retries=max_retries,
+            )
+            if obj_resp and obj_resp.get("data"):
+                kid = _extract_kiosk_id_from_personal_cap(obj_resp["data"])
+                if kid:
+                    kiosk_ids.append(kid)
+                else:
+                    logging.debug(
+                        f"PersonalKioskCap {cap_id} found but could not "
+                        f"extract kiosk ID from content"
+                    )
+        except Exception as e:
+            logging.warning(f"Error fetching PersonalKioskCap {cap_id}: {e}")
+
+    return kiosk_ids
+
 
 def _fetch_kiosk_nfts(addresses, collection_id, show_content=False, max_retries=2):
     """Fetch NFTs held inside SUI Kiosks owned by *addresses*.
@@ -3464,7 +3585,9 @@ def _fetch_kiosk_nfts(addresses, collection_id, show_content=False, max_retries=
     placed inside a Kiosk are **not** directly owned by the user's address, so
     ``suix_getOwnedObjects`` with a ``StructType`` filter will not find them.
 
-    This helper discovers the user's Kiosks via their ``KioskOwnerCap`` objects,
+    This helper discovers the user's Kiosks via their ``KioskOwnerCap`` objects
+    **and** ``PersonalKioskCap`` objects (used by collections like PrimeMachin
+    and EMP that require personal kiosks for transfer-policy enforcement),
     then enumerates each Kiosk's dynamic fields to count items matching
     *collection_id*.
     """
@@ -3481,8 +3604,9 @@ def _fetch_kiosk_nfts(addresses, collection_id, show_content=False, max_retries=
 
     results = []
     for owner in [a.lower() for a in addresses if a]:
-        # Step 1: find all KioskOwnerCap objects → extract Kiosk IDs
+        # Step 1a: find all standard KioskOwnerCap objects → extract Kiosk IDs
         kiosk_ids = []
+        seen_kiosk_ids = set()
         cursor = None
         while True:
             rpc_result = sui_rpc_request(
@@ -3496,11 +3620,32 @@ def _fetch_kiosk_nfts(addresses, collection_id, show_content=False, max_retries=
                 content = obj.get("content") or {}
                 fields = content.get("fields") or {}
                 kiosk_id = fields.get("for")
-                if kiosk_id:
+                if kiosk_id and kiosk_id not in seen_kiosk_ids:
+                    seen_kiosk_ids.add(kiosk_id)
                     kiosk_ids.append(kiosk_id)
             if not rpc_result or not rpc_result.get("hasNextPage"):
                 break
             cursor = rpc_result.get("nextCursor")
+
+        # Step 1b: find kiosks via PersonalKioskCap (used by collections
+        # that enforce personal-kiosk transfer policies, e.g. PrimeMachin).
+        try:
+            personal_kiosk_ids = _fetch_personal_kiosk_ids(
+                owner, max_retries=max_retries,
+            )
+            for kid in personal_kiosk_ids:
+                if kid not in seen_kiosk_ids:
+                    seen_kiosk_ids.add(kid)
+                    kiosk_ids.append(kid)
+            if personal_kiosk_ids:
+                logging.debug(
+                    f"Found {len(personal_kiosk_ids)} personal kiosk(s) "
+                    f"for {owner}"
+                )
+        except Exception as e:
+            logging.warning(
+                f"PersonalKioskCap scan failed for {owner}: {e}"
+            )
 
         # Step 2: enumerate each Kiosk's dynamic fields for matching NFTs
         for kiosk_id in kiosk_ids:
