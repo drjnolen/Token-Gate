@@ -1295,6 +1295,30 @@ def check_user_wallets():
                 below_users_to_alert = []
                 for reg in user_regs:
                     user_id = reg["user_id"]
+
+                    # Verify user is still in the group to prevent spamming inactive/departed users
+                    try:
+                        member = bot.get_chat_member(group_id, user_id)
+                        if member.status in ["left", "kicked"]:
+                            logging.info(f"User {user_id} has left or was kicked from group {group_id}. Cleaning up database registration.")
+                            with get_db_cursor() as (conn, cur):
+                                cur.execute("DELETE FROM user_wallets WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                cur.execute("DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                cur.execute("DELETE FROM pending_verifications WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                            continue
+                    except telebot.apihelper.ApiTelegramException as api_e:
+                        if any(phrase in str(api_e).lower() for phrase in ["user not found", "chat not found", "bot was kicked", "forbidden"]):
+                            logging.info(f"User {user_id} is no longer accessible in group {group_id} ({api_e}). Cleaning up database registration.")
+                            with get_db_cursor() as (conn, cur):
+                                cur.execute("DELETE FROM user_wallets WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                cur.execute("DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                cur.execute("DELETE FROM pending_verifications WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                            continue
+                        else:
+                            logging.error(f"Error checking membership for user {user_id} in group {group_id}: {api_e}")
+                    except Exception as e:
+                        logging.error(f"Error checking membership for user {user_id} in group {group_id}: {e}")
+
                     if reg["is_exempt"] or not reg["wallets"]:
                         continue
 
@@ -4133,19 +4157,28 @@ def exempt_command(message):
 
 @bot.chat_member_handler()
 def handle_chat_member_update(update):
-    """Handle new members joining the group and send registration reminders."""
+    """Handle new members joining the group and clean up database registrations when members leave."""
     try:
+        group_id = update.chat.id
+        user_id = update.new_chat_member.user.id
+        user_name = update.new_chat_member.user.first_name or f"User {user_id}"
+
+        # Skip if it's the bot itself
+        if user_id == get_bot_id():
+            return
+
+        # Check if a member has left, was kicked, or was banned
+        if update.new_chat_member.status in ['left', 'kicked']:
+            logging.info(f"Member {user_name} ({user_id}) left or was removed from group {group_id}. Cleaning up database registration.")
+            with get_db_cursor() as (conn, cur):
+                cur.execute("DELETE FROM user_wallets WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                cur.execute("DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                cur.execute("DELETE FROM pending_verifications WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+            return
+
         # Check if this is a new member joining
         if (update.new_chat_member.status in ['member', 'administrator'] and 
             update.old_chat_member.status in ['left', 'kicked', 'restricted']):
-
-            group_id = update.chat.id
-            user_id = update.new_chat_member.user.id
-            user_name = update.new_chat_member.user.first_name
-
-            # Skip if it's the bot itself
-            if user_id == get_bot_id():
-                return
 
             logging.info(f"New member {user_name} ({user_id}) joined group {group_id}")
 
