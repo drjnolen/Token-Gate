@@ -99,7 +99,7 @@ def register(bot, deps):
                     cfg = SUBSCRIBER_CONFIGS.get(group_id)
                 if not cfg:
                     bot.edit_message_text(
-                        "❌ This group isn't set up yet. Ask an admin to run /gsconfig first.",
+                        "❌ This group isn't set up yet. Ask an admin to run /cwconfig first.",
                         chat_id=call.message.chat.id,
                         message_id=call.message.message_id
                     )

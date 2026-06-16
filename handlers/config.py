@@ -1,6 +1,6 @@
 """Configuration handlers for Token-Gate bot.
 
-Handles /gsconfig command and the private config callback menu.
+Handles /cwconfig command and the private config callback menu.
 """
 
 import logging
@@ -68,7 +68,7 @@ def register(bot, deps):
     process_set_vote_duration = deps['process_set_vote_duration']
     process_set_votes_per_exempt = deps['process_set_votes_per_exempt']
 
-    @bot.message_handler(commands=['gsconfig'])
+    @bot.message_handler(commands=['cwconfig'])
     @admin_required
     def config_command(message):
         markup = types.InlineKeyboardMarkup()

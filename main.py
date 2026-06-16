@@ -109,7 +109,7 @@ SUBSCRIPTION_TIERS = {
     "6month": {"label": "6 Months", "price_cents": 2199, "days": 180, "display": "$21.99"},
 }
 
-BOT_NAME = "GuildSafeBot"
+BOT_NAME = "CityWatchBot"
 CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
 ADMIN_MEMBER_STATUSES = frozenset({"creator", "administrator"})
 ACTIVE_GROUP_MEMBER_STATUSES = frozenset({"creator", "administrator", "member", "restricted"})
@@ -959,7 +959,7 @@ def create_stripe_checkout_session(group_id, user_id, tier):
                 "currency": "usd",
                 "unit_amount": tier_info["price_cents"],
                 "product_data": {
-                    "name": f"GuildSafeBot – {tier_info['label']} Subscription",
+                    "name": f"CityWatchBot – {tier_info['label']} Subscription",
                     "description": f"Token-gating bot subscription for {tier_info['label'].lower()}",
                 },
             },
@@ -1574,7 +1574,7 @@ def reminder_command(message):
 @bot.message_handler(commands=['help'])
 def help_command(message):
     help_text = (
-        "🤖 *Welcome to GuildSafe!* 🤖\n\n"
+        "🤖 *Welcome to CityWatch!* 🤖\n\n"
         "This bot helps manage group access based on token or NFT holdings.\n\n"
         "--- *For All Users* ---\n\n"
         "🔑 *How to Register:*\n"
@@ -1585,7 +1585,7 @@ def help_command(message):
         "`/mywallets` - View your registered wallets, check balances, and add or remove them securely in our private chat.\n\n"
         "--- *For Group Admins* ---\n\n"
         "⚙️ *Configuration:*\n"
-        "`/gsconfig` - Opens the main group configuration menu in a private chat.\n"
+        "`/cwconfig` - Opens the main group configuration menu in a private chat.\n"
         "`/votesetup` - Configures the rules for weighted voting.\n\n"
         "🗳️ *Voting:*\n"
         "`/vote` - Creates a new weighted poll in the group.\n\n"
@@ -1607,7 +1607,7 @@ def help_command(message):
         except Exception as e2:
             logging.error(f"Failed to send plain help message: {e2}")
 
-@bot.message_handler(commands=['gsconfig'])
+@bot.message_handler(commands=['cwconfig'])
 @admin_required
 def config_command(message):
     # Create inline keyboard with private chat button
@@ -2190,7 +2190,7 @@ def handle_verify_wallet_callback(call):
                 cfg = SUBSCRIBER_CONFIGS.get(group_id)
             if not cfg:
                 bot.edit_message_text(
-                    "❌ This group isn't set up yet. Ask an admin to run /gsconfig first.",
+                    "❌ This group isn't set up yet. Ask an admin to run /cwconfig first.",
                     chat_id=call.message.chat.id,
                     message_id=call.message.message_id
                 )
@@ -2384,7 +2384,7 @@ def show_subscription_prompt(chat_id, group_id, group_name):
     bot.send_message(
         chat_id,
         f"🔒 **Subscription Required**\n\n"
-        f"To configure and use GuildSafeBot in *{group_name}*, "
+        f"To configure and use CityWatchBot in *{group_name}*, "
         f"an active subscription is required.\n"
         f"{status_line}\n"
         f"Choose a plan below:\n\n"
@@ -4583,9 +4583,9 @@ def handle_start(message):
             except ValueError:
                 bot.reply_to(message, "❌ Invalid mywallets parameter.")
         else:
-            bot.reply_to(message, "👋 Welcome to GuildSafe!")
+            bot.reply_to(message, "👋 Welcome to CityWatch!")
     else:
-        bot.reply_to(message, "👋 Welcome to GuildSafe! Use /help to see available commands.")
+        bot.reply_to(message, "👋 Welcome to CityWatch! Use /help to see available commands.")
 
 def build_wallet_connect_url(group_id, user_id, cfg=None):
     """Build a verification URL for the built-in Telegram mini-app.
@@ -4807,7 +4807,7 @@ def handle_wallet_webapp_data(message):
     with config_lock:
         cfg = SUBSCRIBER_CONFIGS.get(group_id)
     if not cfg:
-        bot.reply_to(message, "❌ This group isn't set up yet. Ask an admin to run /gsconfig first.")
+        bot.reply_to(message, "❌ This group isn't set up yet. Ask an admin to run /cwconfig first.")
         return
 
     # Always perform authoritative server-side verification regardless of what
@@ -5145,7 +5145,7 @@ def api_verify():
         with config_lock:
             cfg = SUBSCRIBER_CONFIGS.get(group_id)
         if not cfg:
-            resp = jsonify({'success': False, 'error': 'Group is not configured. Ask an admin to run /gsconfig first.'})
+            resp = jsonify({'success': False, 'error': 'Group is not configured. Ask an admin to run /cwconfig first.'})
             return _add_cors_headers(resp), 400
 
         # When the call comes from the trusted external website (valid webhook
@@ -5328,7 +5328,7 @@ def stripe_webhook():
                             f"Your *{tier_info.get('label', tier)}* subscription for "
                             f"*{gname}* is now active.\n\n"
                             f"📅 Expires: {new_expiry.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-                            f"You can now use /gsconfig to configure the bot.",
+                            f"You can now use /cwconfig to configure the bot.",
                             parse_mode="Markdown"
                         )
                     except Exception as notify_e:
@@ -5355,8 +5355,8 @@ def subscription_success():
         'h1{color:#22c55e;margin:0 0 .5rem}p{color:#555;line-height:1.5}'
         '</style></head><body><div class="card">'
         '<h1>✅ Payment Successful</h1>'
-        '<p>Your GuildSafeBot subscription is now active.</p>'
-        '<p>Return to Telegram and run <b>/gsconfig</b> to configure your group.</p>'
+        '<p>Your CityWatchBot subscription is now active.</p>'
+        '<p>Return to Telegram and run <b>/cwconfig</b> to configure your group.</p>'
         '</div></body></html>'
     ), 200
 
@@ -5375,7 +5375,7 @@ def subscription_cancel():
         'h1{color:#ef4444;margin:0 0 .5rem}p{color:#555;line-height:1.5}'
         '</style></head><body><div class="card">'
         '<h1>❌ Payment Cancelled</h1>'
-        '<p>No charges were made. You can try again anytime by running <b>/gsconfig</b> in your Telegram group.</p>'
+        '<p>No charges were made. You can try again anytime by running <b>/cwconfig</b> in your Telegram group.</p>'
         '</div></body></html>'
     ), 200
 
@@ -5580,7 +5580,7 @@ if __name__ == "__main__":
                 telebot.types.BotCommand("help", "Show help information"),
                 telebot.types.BotCommand("register", "Register your wallet addresses"),
                 telebot.types.BotCommand("mywallets", "View and manage your registered wallets"),
-                telebot.types.BotCommand("gsconfig", "Configure group settings (admins only)"),
+                telebot.types.BotCommand("cwconfig", "Configure group settings (admins only)"),
                 telebot.types.BotCommand("votesetup", "Configure voting settings (admins only)"),
                 telebot.types.BotCommand("vote", "Create a new poll (admins only)"),
                 telebot.types.BotCommand("reminder", "Send registration reminder (admins only)"),
