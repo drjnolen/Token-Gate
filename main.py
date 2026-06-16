@@ -5576,7 +5576,28 @@ if __name__ == "__main__":
     # Register bot commands for auto-completion
     def register_bot_commands():
         try:
-            commands = [
+            # Retrieve bot username to ensure it is authenticated and fetched
+            username = get_bot_username()
+            logging.info(f"Registering bot commands for @{username}...")
+
+            # 1. Default commands (for private chats)
+            private_commands = [
+                telebot.types.BotCommand("help", "Show help information"),
+                telebot.types.BotCommand("register", "Register your wallet addresses"),
+                telebot.types.BotCommand("mywallets", "View and manage your registered wallets"),
+            ]
+            bot.set_my_commands(private_commands, scope=telebot.types.BotCommandScopeAllPrivateChats())
+
+            # 2. Public group commands (visible to all members in groups)
+            group_commands = [
+                telebot.types.BotCommand("help", "Show help information"),
+                telebot.types.BotCommand("register", "Register your wallet addresses"),
+                telebot.types.BotCommand("mywallets", "View and manage your registered wallets"),
+            ]
+            bot.set_my_commands(group_commands, scope=telebot.types.BotCommandScopeAllGroupChats())
+
+            # 3. Admin commands (visible only to chat administrators in groups)
+            admin_commands = [
                 telebot.types.BotCommand("help", "Show help information"),
                 telebot.types.BotCommand("register", "Register your wallet addresses"),
                 telebot.types.BotCommand("mywallets", "View and manage your registered wallets"),
@@ -5587,8 +5608,12 @@ if __name__ == "__main__":
                 telebot.types.BotCommand("exempt", "Exempt a user from wallet requirements (admins only)"),
                 telebot.types.BotCommand("addwallet", "Add wallet for a user by reply or user ID (admins only)"),
             ]
-            bot.set_my_commands(commands)
-            logging.info("Bot commands registered successfully")
+            bot.set_my_commands(admin_commands, scope=telebot.types.BotCommandScopeAllChatAdministrators())
+
+            # 4. Default commands as fallback
+            bot.set_my_commands(admin_commands)  # Keep admin commands in default scope for legacy support / backward compatibility
+
+            logging.info(f"Bot commands for @{username} registered successfully across all scopes.")
         except Exception as e:
             logging.error(f"Failed to register bot commands: {e}")
 
