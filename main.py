@@ -2026,29 +2026,7 @@ def handle_mywallets_callback(call):
 
         bot.answer_callback_query(call.id)
 
-        if action == "add":
-            msg = bot.send_message(call.message.chat.id, "Please send the new wallet address you wish to add:", reply_markup=types.ForceReply(selective=True))
-            bot.register_next_step_handler(msg, process_add_wallet_private, group_id, False)
-        elif action == "replace":
-            msg = bot.send_message(call.message.chat.id, "Please send the new wallet address. This will replace all your existing wallets.", reply_markup=types.ForceReply(selective=True))
-            bot.register_next_step_handler(msg, process_add_wallet_private, group_id, True)
-        elif action == "remove":
-            user_reg = get_user_registration(group_id, user_id)
-            wallets = user_reg.get("wallets", []) if user_reg else []
-            if not wallets:
-                bot.send_message(call.message.chat.id, "ℹ️ You have no wallets to remove.")
-                return
-
-            markup = types.InlineKeyboardMarkup()
-            for i, wallet in enumerate(wallets):
-                display_wallet = f"{wallet[:8]}...{wallet[-6:]}"
-                callback_data = f"mywallet_{group_id}_dodelete_{i}"
-                markup.add(types.InlineKeyboardButton(f"🗑️ {display_wallet}", callback_data=callback_data))
-
-            markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data=f"mywallet_{group_id}_back"))
-            bot.edit_message_text("Select a wallet to remove:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
-
-        elif action == "dodelete" and len(parts) == 4:
+        if action == "dodelete" and len(parts) == 4:
             try:
                 wallet_idx = int(parts[3])
             except (ValueError, TypeError):
@@ -2056,6 +2034,7 @@ def handle_mywallets_callback(call):
                 return
             user_reg = get_user_registration(group_id, user_id)
             current_wallets = user_reg.get("wallets", []) if user_reg else []
+            is_exempt = user_reg.get("is_exempt", False) if user_reg else False
 
             if wallet_idx < 0 or wallet_idx >= len(current_wallets):
                 bot.answer_callback_query(call.id, "❌ Wallet not found.")
@@ -2068,7 +2047,15 @@ def handle_mywallets_callback(call):
             with config_lock:
                 cfg = SUBSCRIBER_CONFIGS.get(group_id)
                 reg_type = cfg.get("registration_mode", "token") if cfg else "token"
-            save_wallet_for_user(group_id, user_id, call.from_user.username or call.from_user.first_name, updated_wallets, replace_existing=True, registration_type=reg_type)
+            save_wallet_for_user(
+                group_id, 
+                user_id, 
+                call.from_user.username or call.from_user.first_name, 
+                updated_wallets, 
+                is_exempt=is_exempt,
+                replace_existing=True, 
+                registration_type=reg_type
+            )
             bot.send_message(call.message.chat.id, "✅ Wallet removed successfully.")
             bot.delete_message(call.message.chat.id, call.message.message_id)
             show_mywallets_private(call.message.chat.id, group_id)
@@ -2079,220 +2066,6 @@ def handle_mywallets_callback(call):
 
     except Exception as e:
         logging.error(f"Error in handle_mywallets_callback: {e}")
-        bot.answer_callback_query(call.id, "❌ An error occurred.")
-
-def process_add_wallet_private(message, group_id, replace_existing):
-    """Handles adding or replacing a wallet from the private menu."""
-    try:
-        user_id = message.from_user.id
-        wallet_address = message.text.strip()
-
-        if not is_valid_wallet_address(wallet_address):
-            bot.reply_to(message, "❌ Invalid wallet address format. Please try again.")
-            return
-
-        if wallet_already_registered(wallet_address, group_id, user_id=user_id):
-            bot.reply_to(message, "⚠️ This wallet address is already registered to another user in this group.")
-            return
-
-        # Since this is a direct add/replace, we skip the balance check and go to ownership verification
-        with get_db_cursor() as (conn, cur):
-            cur.execute("""
-                INSERT INTO pending_verifications (user_id, group_id, wallet_address, created_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    group_id = EXCLUDED.group_id,
-                    wallet_address = EXCLUDED.wallet_address,
-                    created_at = EXCLUDED.created_at
-            """, (user_id, group_id, wallet_address))
-
-        verification_message = (
-            "**🔐 On-Chain Verification Required:**\n\n"
-            f"To add the wallet `{wallet_address}`, click below to complete on-chain balance/NFT validation.\n\n"
-            "No transfer is required.\n\n"
-            f"⏰ _This verification request will expire in {VERIFICATION_TIMEOUT // 60} minutes._"
-        )
-
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("✅ Confirm Wallet", callback_data=f"verify_wallet_{user_id}"))
-
-        bot.send_message(message.chat.id, verification_message, parse_mode="Markdown", reply_markup=markup)
-
-    except Exception as e:
-        logging.error(f"Error in process_add_wallet_private: {e}")
-        bot.reply_to(message, "❌ An error occurred while processing your request. Please try again.")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("verify_wallet_"))
-def handle_verify_wallet_callback(call):
-    """Handle wallet verification confirmation via inline button."""
-    try:
-        user_id = call.from_user.id
-        
-        parts = call.data.split("_")
-        if len(parts) != 3:
-            bot.answer_callback_query(call.id, "❌ Invalid verification request.")
-            return
-        
-        expected_user_id = int(parts[2])
-        if user_id != expected_user_id:
-            bot.answer_callback_query(call.id, "❌ This verification is not for you.")
-            return
-
-        with get_db_cursor() as (conn, cur):
-            cur.execute("SELECT group_id, wallet_address, created_at FROM pending_verifications WHERE user_id = %s", (user_id,))
-            verification_data = cur.fetchone()
-
-        if not verification_data:
-            bot.answer_callback_query(call.id, "❌ No pending verification found.")
-            bot.edit_message_text(
-                "❌ No pending wallet verification found.\n\n"
-                "Please use /register to start the verification process.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-            return
-
-        group_id, wallet_address, timestamp = verification_data
-
-        if not wallet_address or not isinstance(wallet_address, str):
-            bot.answer_callback_query(call.id, "❌ Invalid wallet data.")
-            with get_db_cursor() as (conn, cur):
-                cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
-            bot.edit_message_text(
-                "❌ Invalid wallet address in verification data.\n\n"
-                "Please use /register to start the verification process again.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-            return
-
-        if not timestamp or time.time() - timestamp.timestamp() > VERIFICATION_TIMEOUT:
-            with get_db_cursor() as (conn, cur):
-                cur.execute("DELETE FROM pending_verifications WHERE user_id = %s", (user_id,))
-            bot.answer_callback_query(call.id, "⏰ Verification timed out.")
-            bot.edit_message_text(
-                "❌ Verification timed out.\n\n"
-                "Please use /register to start the verification process again.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
-            )
-            return
-
-        bot.answer_callback_query(call.id, "Re-checking on-chain holdings...")
-        bot.edit_message_text(
-            "⏳ Re-validating your on-chain token/NFT holdings...",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id
-        )
-
-        try:
-            with config_lock:
-                cfg = SUBSCRIBER_CONFIGS.get(group_id)
-            if not cfg:
-                bot.edit_message_text(
-                    "❌ This group isn't set up yet. Ask an admin to run /cwconfig first.",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id
-                )
-                return
-
-            requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
-            if not requirement_eval["requirements_met"]:
-                error_text = "❌ *Wallet Requirements Not Met*\n\n" + "\n".join(
-                    requirement_eval["errors"] or ["Please retry after updating your holdings."]
-                )
-                if requirement_eval["details"]:
-                    error_text += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval["details"])
-                bot.edit_message_text(
-                    error_text,
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    parse_mode="Markdown"
-                )
-                return
-
-            verification_details = requirement_eval["details"]
-
-            success = save_wallet_for_user(
-                group_id,
-                user_id,
-                call.from_user.username or call.from_user.first_name,
-                [wallet_address.lower()],
-                replace_existing=False,
-                registration_type=cfg.get("registration_mode", "token")
-            )
-
-            if not success:
-                bot.edit_message_text(
-                    "❌ Failed to save your wallet. Please try again later.",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id
-                )
-                return
-
-            try:
-                chat_obj = bot.get_chat(group_id)
-                group_name = chat_obj.title
-            except Exception as e:
-                logging.warning(f"Could not resolve group title for {group_id}: {e}")
-                group_name = f"Group {group_id}"
-
-            text_lines = [
-                "✅ *Wallet Verification Successful!*",
-                "",
-                f"*Group:* {group_name}",
-                f"*Wallet:* `{wallet_address}`",
-            ]
-            
-            if verification_details:
-                text_lines.append("")
-                text_lines.append("📋 *Verification Details:*")
-                text_lines.extend(verification_details)
-            
-            text_lines.append("")
-            text_lines.append("Your wallet has been registered. You can now participate in group activities!")
-
-            try:
-                invite = create_single_use_invite_link(group_id)
-                if invite:
-                    text_lines += [
-                        "",
-                        "*Group Invite Link:*",
-                        f"[Join {group_name}]({invite})",
-                        "_Use this link to join or return to the group._"
-                    ]
-            except Exception as e:
-                logging.error(f"Error fetching invite link for group {group_id}: {e}")
-
-            bot.edit_message_text(
-                "\n".join(text_lines),
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode="Markdown"
-            )
-
-            with get_db_cursor() as (conn, cur):
-                cur.execute("""
-                    UPDATE pending_verifications 
-                    SET wallet_address = NULL, created_at = NOW()
-                    WHERE user_id = %s
-                """, (user_id,))
-
-            logging.info(f"Wallet verification successful for user {user_id}, wallet {wallet_address}")
-
-        except Exception as e:
-            logging.error(f"Error during callback verification: {e}")
-            try:
-                bot.edit_message_text(
-                    "❌ Error confirming verification. Please try again later.",
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id
-                )
-            except Exception:
-                pass
-
-    except Exception as e:
-        logging.error(f"Error in handle_verify_wallet_callback: {e}")
         bot.answer_callback_query(call.id, "❌ An error occurred.")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("poll_vote_"))
@@ -2527,11 +2300,23 @@ def show_mywallets_private(chat_id, group_id):
             logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
 
+        # Get group configuration for balance checking and link generation
+        with config_lock:
+            config = SUBSCRIBER_CONFIGS.get(group_id, {})
+
+        # Build registration URL for the website-gated flow
+        connect_url = build_wallet_connect_url(group_id, user_id, cfg=config)
+        verify_url = f"{connect_url}&source=telegram_mywallets"
+
+        markup = types.InlineKeyboardMarkup()
+        verify_btn = types.InlineKeyboardButton("➕ Add/Verify Wallet", url=verify_url)
+        markup.add(verify_btn)
+
         # Get user registration data
         user_reg = get_user_registration(group_id, user_id)
 
         if not user_reg:
-            bot.send_message(chat_id, f"❌ You are not registered in {group_name}. Use /register to register your wallet.")
+            bot.send_message(chat_id, f"❌ You are not registered in {group_name}.", reply_markup=markup)
             return
 
         if user_reg["is_exempt"]:
@@ -2540,12 +2325,8 @@ def show_mywallets_private(chat_id, group_id):
 
         wallets = user_reg["wallets"]
         if not wallets:
-            bot.send_message(chat_id, f"❌ You have no registered wallets for {group_name}. Use /register to add a wallet.")
+            bot.send_message(chat_id, f"❌ You have no registered wallets for {group_name}.", reply_markup=markup)
             return
-
-        # Get group configuration for balance checking
-        with config_lock:
-            config = SUBSCRIBER_CONFIGS.get(group_id, {})
 
         registration_mode = config.get("registration_mode", "token")
         token = config.get("token", "")
@@ -2668,15 +2449,14 @@ def show_mywallets_private(chat_id, group_id):
             # Create inline keyboard for wallet management
             markup = types.InlineKeyboardMarkup()
 
-            # Add wallet management buttons
-            if len(wallets) > 1:
-                remove_btn = types.InlineKeyboardButton("🗑️ Remove Wallet", callback_data=f"mywallet_{group_id}_remove")
-                markup.add(remove_btn)
+            # Add inline delete buttons for each individual wallet
+            for i, wallet in enumerate(wallets):
+                display_wallet = f"{wallet[:8]}...{wallet[-6:]}"
+                callback_data = f"mywallet_{group_id}_dodelete_{i}"
+                markup.add(types.InlineKeyboardButton(f"🗑️ Remove {display_wallet}", callback_data=callback_data))
 
-            replace_btn = types.InlineKeyboardButton("🔄 Replace All Wallets", callback_data=f"mywallet_{group_id}_replace")
-            add_btn = types.InlineKeyboardButton("➕ Add Another Wallet", callback_data=f"mywallet_{group_id}_add")
-
-            markup.add(replace_btn)
+            # Add/Verify Wallet button pointing to the website-gated flow
+            add_btn = types.InlineKeyboardButton("➕ Add/Verify Wallet", url=verify_url)
             markup.add(add_btn)
 
             wallet_message = "\n".join(message_lines)
