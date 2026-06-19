@@ -204,7 +204,16 @@ def _apply_verify_token_fallback(requirement_eval, balance_verified, verify_toke
             f"{context_label}: server-side RPC failed for user {user_id}, "
             f"group {group_id} — accepting client-side verification (valid page token)"
         )
-        return {"requirements_met": True, "details": requirement_eval.get('details', []), "errors": []}
+        # Clean up details to show that they passed via client-side check
+        old_details = requirement_eval.get('details', [])
+        new_details = []
+        for d in old_details:
+            if "⚠️ check failed" in d:
+                d = d.replace("⚠️ check failed", "✓ passed (verified client-side)")
+            elif "⚠️ Check failed" in d:
+                d = d.replace("⚠️ Check failed", "✓ passed (verified client-side)")
+            new_details.append(d)
+        return {"requirements_met": True, "details": new_details, "errors": []}
     return requirement_eval
 
 
