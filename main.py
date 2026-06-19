@@ -29,14 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from waitress import serve as waitress_serve
 
 # ==================== Refactored Module Imports ====================
-# Database operations are also available in db.py for new code.
-# Telegram handlers are also organized in handlers/ sub-modules.
 # HTML templates are in templates/ directory (Jinja2).
-import db as db_module
-from handlers import config as config_handlers
-from handlers import voting as voting_handlers
-from handlers import verification as verification_handlers
-from handlers import subscriptions as subscription_handlers
 
 # ==================== Global Constants ===========================
 CACHE_TTL = 1200      # Cache Time-To-Live in seconds (20 minutes)
@@ -120,7 +113,7 @@ INACTIVE_MEMBER_STATUS_MESSAGES = {
 
 # Maximum age (in seconds) for verify-page tokens used to authenticate
 # requests coming from the bot's own /verify page.
-_VERIFY_TOKEN_MAX_AGE = 600  # 10 minutes
+_VERIFY_TOKEN_MAX_AGE = 7200  # 2 hours
 
 
 def encode_group_id_for_deeplink(group_id):
@@ -556,6 +549,11 @@ def init_db():
                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Create indexes for frequently queried columns to optimize performance
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_user_wallets_user ON user_wallets(user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_voting_polls_group ON voting_polls(group_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_voting_polls_active ON voting_polls(is_active) WHERE is_active = TRUE")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_verifications_created_at ON pending_verifications(created_at)")
         try:
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS auto_remove BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_collection_id TEXT DEFAULT ''")
@@ -707,19 +705,30 @@ def get_registration_mode_display(mode):
     return mode_display.get(mode, mode.title())
 
 @db_retry
-def save_wallet_for_user(group_id, user_id, username, wallet_list, is_exempt=False, replace_existing=False, registration_type="token"):
+def save_wallet_for_user(group_id, user_id, username, wallet_list, is_exempt=None, replace_existing=False, registration_type="token"):
     with get_db_cursor() as (conn, cur):
         existing_wallets = []
-        if not replace_existing:
-            cur.execute("SELECT wallets, is_exempt FROM user_wallets WHERE group_id=%s AND user_id=%s", (group_id, user_id))
-            result = cur.fetchone()
-            if result and result[0]:
-                try:
+        existing_exempt = False
+        
+        # Always check for existing registration to preserve is_exempt if not explicitly provided
+        cur.execute("SELECT wallets, is_exempt FROM user_wallets WHERE group_id=%s AND user_id=%s", (group_id, user_id))
+        result = cur.fetchone()
+        if result:
+            try:
+                if result[0]:
                     existing_wallets = json.loads(result[0])
                     logging.info(f"Found existing wallets for user {username}: {len(existing_wallets)} wallets")
-                    is_exempt = result[1] or is_exempt
-                except Exception as e:
-                    logging.error(f"Error parsing existing wallets: {e}")
+                existing_exempt = bool(result[1])
+            except Exception as e:
+                logging.error(f"Error parsing existing wallets: {e}")
+
+        # If is_exempt is not explicitly set, preserve the existing state
+        if is_exempt is None:
+            is_exempt = existing_exempt
+        else:
+            # If they were already exempt, preserve it unless explicitly overridden
+            is_exempt = is_exempt or existing_exempt
+
         if existing_wallets and not replace_existing:
             existing_lower = [w.lower() for w in existing_wallets]
             combined_wallets = []
@@ -1125,55 +1134,77 @@ def sui_rpc_request(method: str, params, max_retries: int = 3):
         response.raise_for_status()
         data = response.json()
         if 'error' in data:
-            raise requests.exceptions.RequestException(f"Sui RPC error for {method}: {data['error']}")
+            err = data['error']
+            # If the RPC returned a 200 but the inner JSON payload indicates a rate limit
+            err_msg = str(err).lower()
+            if 'rate limit' in err_msg or 'too many requests' in err_msg or 'throttled' in err_msg:
+                # Set status code to 429 dynamically so retry decorator treats it as rate limited
+                response.status_code = 429
+            raise requests.exceptions.RequestException(f"Sui RPC error for {method}: {err}", response=response)
         return data.get('result')
 
     return make_api_request_with_retry(do_request, max_retries=max_retries)
 
 
 def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, cache_ttl=None):
-    """Fetch token balances directly from Sui RPC (on-chain), no third-party indexers."""
+    """Fetch token balances directly from Sui RPC (on-chain), no third-party indexers.
+    
+    Caches balances on an individual wallet address level to prevent unnecessary RPC calls.
+    """
     results = {}
     current_time = time.time()
-    cache_key = f"{','.join(sorted(addresses))}|{monitored_token}|{decimals}"
-
     effective_cache_ttl = CACHE_TTL if cache_ttl is None else cache_ttl
+    monitored_token_lower = monitored_token.lower()
 
+    # 1. Identify which addresses can be served from cache
+    missing_addresses = []
     with cache_lock:
-        if use_cache and cache_key in balance_cache:
-            cache_time, cache_result = balance_cache[cache_key]
-            if current_time - cache_time < effective_cache_ttl:
-                return cache_result
+        for addr in addresses:
+            addr_lower = addr.lower()
+            cache_key = f"{addr_lower}|{monitored_token_lower}"
+            if use_cache and cache_key in balance_cache:
+                cache_time, cached_val = balance_cache[cache_key]
+                if current_time - cache_time < effective_cache_ttl:
+                    results[addr_lower] = cached_val
+                    continue
+            missing_addresses.append(addr_lower)
 
-    for wallet in addresses:
-        wallet_lower = wallet.lower()
-        try:
-            result = sui_rpc_request("suix_getBalance", [wallet_lower, monitored_token])
-            raw_balance = result.get("totalBalance", "0") if result else "0"
-            amount = float(raw_balance) / (10 ** decimals)
-            results[wallet_lower] = amount
-        except Exception as e:
-            logging.error(f"Failed to fetch on-chain balance for {wallet_lower}: {e}")
-            results[wallet_lower] = None
-        time.sleep(WALLET_FETCH_DELAY)  # Brief pause between wallets to avoid RPC burst traffic.
+    # 2. Fetch missing balances from RPC
+    if missing_addresses:
+        for wallet in missing_addresses:
+            wallet_lower = wallet.lower()
+            try:
+                # Base balance check
+                result = sui_rpc_request("suix_getBalance", [wallet_lower, monitored_token])
+                raw_balance = result.get("totalBalance", "0") if result else "0"
+                amount = float(raw_balance) / (10 ** decimals)
+                
+                # If $CITY token, also fetch staked CITY balance
+                if monitored_token == CITY_TOKEN_TYPE:
+                    staked = _fetch_staked_city_balance(wallet_lower, decimals)
+                    if staked is not None:
+                        amount += staked
+                    else:
+                        logging.warning(f"Could not fetch staked CITY for {wallet_lower}; using base balance only.")
+                
+                results[wallet_lower] = amount
 
-    if monitored_token == CITY_TOKEN_TYPE:
-        for wallet_lower in list(results.keys()):
-            if results[wallet_lower] is None:
-                continue
-            staked = _fetch_staked_city_balance(wallet_lower, decimals)
-            if staked is not None:
-                results[wallet_lower] = results[wallet_lower] + staked
-            else:
-                logging.warning(f"Could not fetch staked CITY for {wallet_lower}; using base balance only.")
+                # Cache the individual balance
+                if use_cache:
+                    with cache_lock:
+                        if len(balance_cache) >= MAX_CACHE_SIZE:
+                            sorted_keys = sorted(balance_cache.keys(), key=lambda k: balance_cache[k][0])
+                            for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
+                                del balance_cache[old_key]
+                        cache_key = f"{wallet_lower}|{monitored_token_lower}"
+                        balance_cache[cache_key] = (current_time, amount)
 
-    with cache_lock:
-        if len(balance_cache) >= MAX_CACHE_SIZE:
-            sorted_keys = sorted(balance_cache.keys(), key=lambda k: balance_cache[k][0])
-            for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
-                del balance_cache[old_key]
+            except Exception as e:
+                logging.error(f"Failed to fetch on-chain balance for {wallet_lower}: {e}")
+                results[wallet_lower] = None
+            
+            time.sleep(WALLET_FETCH_DELAY)
 
-        balance_cache[cache_key] = (current_time, results)
     return results
 
 
@@ -1296,29 +1327,6 @@ def check_user_wallets():
                 for reg in user_regs:
                     user_id = reg["user_id"]
 
-                    # Verify user is still in the group to prevent spamming inactive/departed users
-                    try:
-                        member = bot.get_chat_member(group_id, user_id)
-                        if member.status in ["left", "kicked"]:
-                            logging.info(f"User {user_id} has left or was kicked from group {group_id}. Cleaning up database registration.")
-                            with get_db_cursor() as (conn, cur):
-                                cur.execute("DELETE FROM user_wallets WHERE group_id = %s AND user_id = %s", (group_id, user_id))
-                                cur.execute("DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id = %s", (group_id, user_id))
-                                cur.execute("DELETE FROM pending_verifications WHERE group_id = %s AND user_id = %s", (group_id, user_id))
-                            continue
-                    except telebot.apihelper.ApiTelegramException as api_e:
-                        if any(phrase in str(api_e).lower() for phrase in ["user not found", "chat not found", "bot was kicked", "forbidden"]):
-                            logging.info(f"User {user_id} is no longer accessible in group {group_id} ({api_e}). Cleaning up database registration.")
-                            with get_db_cursor() as (conn, cur):
-                                cur.execute("DELETE FROM user_wallets WHERE group_id = %s AND user_id = %s", (group_id, user_id))
-                                cur.execute("DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id = %s", (group_id, user_id))
-                                cur.execute("DELETE FROM pending_verifications WHERE group_id = %s AND user_id = %s", (group_id, user_id))
-                            continue
-                        else:
-                            logging.error(f"Error checking membership for user {user_id} in group {group_id}: {api_e}")
-                    except Exception as e:
-                        logging.error(f"Error checking membership for user {user_id} in group {group_id}: {e}")
-
                     if reg["is_exempt"] or not reg["wallets"]:
                         continue
 
@@ -1419,6 +1427,33 @@ def check_user_wallets():
                         user_meets_requirements = token_valid or (nft_valid and trait_valid)
                     
                     if not user_meets_requirements:
+                        # LAZY MEMBERSHIP CHECK: verify if user is still in the group
+                        is_active_member = True
+                        try:
+                            member = bot.get_chat_member(group_id, user_id)
+                            if member.status in ["left", "kicked"]:
+                                logging.info(f"User {user_id} has left or was kicked from group {group_id}. Cleaning up database registration lazily.")
+                                with get_db_cursor() as (conn, cur):
+                                    cur.execute("DELETE FROM user_wallets WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                    cur.execute("DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                    cur.execute("DELETE FROM pending_verifications WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                is_active_member = False
+                        except telebot.apihelper.ApiTelegramException as api_e:
+                            if any(phrase in str(api_e).lower() for phrase in ["user not found", "chat not found", "bot was kicked", "forbidden"]):
+                                logging.info(f"User {user_id} is no longer accessible in group {group_id} ({api_e}). Cleaning up database registration lazily.")
+                                with get_db_cursor() as (conn, cur):
+                                    cur.execute("DELETE FROM user_wallets WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                    cur.execute("DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                    cur.execute("DELETE FROM pending_verifications WHERE group_id = %s AND user_id = %s", (group_id, user_id))
+                                is_active_member = False
+                            else:
+                                logging.error(f"Error checking membership for user {user_id} in group {group_id}: {api_e}")
+                        except Exception as e:
+                            logging.error(f"Error checking membership for user {user_id} in group {group_id}: {e}")
+
+                        if not is_active_member:
+                            continue
+
                         # Auto-remove ONLY for token balance violations (never for NFT/trait)
                         if auto_remove and registration_mode in ["token", "both"] and not token_valid:
                             try:
@@ -3605,20 +3640,20 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None,
         if use_cache and cache_key in nft_cache:
             cache_time, cache_result = nft_cache[cache_key]
             if current_time - cache_time < effective_cache_ttl:
-                return cache_result
+                # cache_result is a list of NFT dict objects
+                return len(cache_result)
 
     try:
-        nfts = _fetch_owned_nfts(normalized_addresses, collection_id, max_retries=max_retries)
-        total_count = len(nfts)
-
+        # Always fetch with show_content=True so the cached items can be reused for trait/category checks!
+        nfts = _fetch_owned_nfts(normalized_addresses, collection_id, show_content=True, max_retries=max_retries)
         with cache_lock:
             if len(nft_cache) >= MAX_CACHE_SIZE:
                 sorted_keys = sorted(nft_cache.keys(), key=lambda k: nft_cache[k][0])
                 for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
                     del nft_cache[old_key]
 
-            nft_cache[cache_key] = (current_time, total_count)
-        return total_count
+            nft_cache[cache_key] = (current_time, nfts)
+        return len(nfts)
 
     except Exception as e:
         logging.error(f"Error getting on-chain NFT count: {e}")
@@ -3692,11 +3727,36 @@ def _extract_traits(obj: dict) -> dict:
     return traits
 
 
-def get_user_nft_trait_count(wallet_addresses, collection_id, trait_name, trait_value):
+def get_user_nft_trait_count(wallet_addresses, collection_id, trait_name, trait_value, use_cache=True, cache_ttl=None):
     """Count NFTs owned by *wallet_addresses* in *collection_id* whose
     *trait_name* equals *trait_value*.  Returns ``None`` on error."""
+    current_time = time.time()
+    normalized_addresses = [addr.lower() for addr in wallet_addresses if addr]
+    collection_hint = _normalize_collection_id(collection_id).lower()
+    cache_key = (tuple(sorted(normalized_addresses)), collection_hint)
+    effective_cache_ttl = NFT_CACHE_TTL if cache_ttl is None else cache_ttl
+
+    nfts = None
+    with cache_lock:
+        if use_cache and cache_key in nft_cache:
+            cache_time, cache_result = nft_cache[cache_key]
+            if current_time - cache_time < effective_cache_ttl:
+                nfts = cache_result
+
+    if nfts is None:
+        try:
+            nfts = _fetch_owned_nfts(normalized_addresses, collection_id, show_content=True)
+            with cache_lock:
+                if len(nft_cache) >= MAX_CACHE_SIZE:
+                    sorted_keys = sorted(nft_cache.keys(), key=lambda k: nft_cache[k][0])
+                    for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
+                        del nft_cache[old_key]
+                nft_cache[cache_key] = (current_time, nfts)
+        except Exception as e:
+            logging.error(f"Error in get_user_nft_trait_count fetching NFTs: {e}")
+            return None
+
     try:
-        nfts = _fetch_owned_nfts(wallet_addresses, collection_id, show_content=True)
         target_key = trait_name.strip().lower()
         target_val = trait_value.strip().lower()
         count = 0
@@ -3706,15 +3766,40 @@ def get_user_nft_trait_count(wallet_addresses, collection_id, trait_name, trait_
                 count += 1
         return count
     except Exception as e:
-        logging.error(f"Error in get_user_nft_trait_count: {e}")
+        logging.error(f"Error in get_user_nft_trait_count processing traits: {e}")
         return None
 
 
-def get_user_nft_category_count(wallet_addresses, collection_id, trait_name):
+def get_user_nft_category_count(wallet_addresses, collection_id, trait_name, use_cache=True, cache_ttl=None):
     """Count NFTs owned by *wallet_addresses* in *collection_id* that have
     any value for *trait_name*.  Returns ``None`` on error."""
+    current_time = time.time()
+    normalized_addresses = [addr.lower() for addr in wallet_addresses if addr]
+    collection_hint = _normalize_collection_id(collection_id).lower()
+    cache_key = (tuple(sorted(normalized_addresses)), collection_hint)
+    effective_cache_ttl = NFT_CACHE_TTL if cache_ttl is None else cache_ttl
+
+    nfts = None
+    with cache_lock:
+        if use_cache and cache_key in nft_cache:
+            cache_time, cache_result = nft_cache[cache_key]
+            if current_time - cache_time < effective_cache_ttl:
+                nfts = cache_result
+
+    if nfts is None:
+        try:
+            nfts = _fetch_owned_nfts(normalized_addresses, collection_id, show_content=True)
+            with cache_lock:
+                if len(nft_cache) >= MAX_CACHE_SIZE:
+                    sorted_keys = sorted(nft_cache.keys(), key=lambda k: nft_cache[k][0])
+                    for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
+                        del nft_cache[old_key]
+                nft_cache[cache_key] = (current_time, nfts)
+        except Exception as e:
+            logging.error(f"Error in get_user_nft_category_count fetching NFTs: {e}")
+            return None
+
     try:
-        nfts = _fetch_owned_nfts(wallet_addresses, collection_id, show_content=True)
         target_key = trait_name.strip().lower()
         count = 0
         for obj in nfts:
@@ -3723,7 +3808,7 @@ def get_user_nft_category_count(wallet_addresses, collection_id, trait_name):
                 count += 1
         return count
     except Exception as e:
-        logging.error(f"Error in get_user_nft_category_count: {e}")
+        logging.error(f"Error in get_user_nft_category_count processing categories: {e}")
         return None
 
 
@@ -3790,10 +3875,10 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
         if nft_trait_name and nft_valid:
             try:
                 if nft_trait_value:
-                    trait_count = get_user_nft_trait_count([wallet_lower], nft_collection_id, nft_trait_name, nft_trait_value)
+                    trait_count = get_user_nft_trait_count([wallet_lower], nft_collection_id, nft_trait_name, nft_trait_value, use_cache=use_cache_flag)
                     trait_desc = f"{nft_trait_name} = {nft_trait_value}"
                 else:
-                    trait_count = get_user_nft_category_count([wallet_lower], nft_collection_id, nft_trait_name)
+                    trait_count = get_user_nft_category_count([wallet_lower], nft_collection_id, nft_trait_name, use_cache=use_cache_flag)
                     trait_desc = f"{nft_trait_name} (any value)"
 
                 if trait_count is None:
@@ -4401,11 +4486,8 @@ def handle_start(message):
         bot.reply_to(message, "👋 Welcome to CityWatch! Use /help to see available commands.")
 
 def build_wallet_connect_url(group_id, user_id, cfg=None):
-    """Build a verification URL for the built-in Telegram mini-app.
-
-    Always prefers the bot's own ``/verify`` endpoint so that verification
-    happens entirely inside the Telegram mini-app without leaving to an
-    external website.
+    """Build a verification URL pointing to the static verify page on alphacity.tech
+    or a custom configured base URL.
 
     When *cfg* is provided the group's token/NFT requirements are appended as
     query parameters so the verify page knows what to check:
@@ -4418,23 +4500,32 @@ def build_wallet_connect_url(group_id, user_id, cfg=None):
       - nft_threshold     : minimum NFT count required
       - sui_rpc           : SUI RPC endpoint for client-side on-chain queries
     """
-    # Always prefer the bot's own /verify endpoint for the mini-app experience.
-    # Fall back to WALLET_CONNECT_URL / hardcoded URL only as a last resort.
-    public_base = get_public_webapp_base_url()
-    if public_base:
-        base_url = f"{public_base.rstrip('/')}/verify"
-    else:
-        base_url = globals().get("WALLET_CONNECT_URL") or os.getenv('WALLET_CONNECT_URL', '').strip()
-        if not base_url:
-            base_url = FALLBACK_VERIFY_URL
+    # Use the static hosted page as the default.
+    base_url = "https://alphacity.tech/verify"
+    override_url = globals().get("WALLET_CONNECT_URL") or os.getenv('WALLET_CONNECT_URL', '').strip()
+    if override_url:
+        base_url = override_url
 
     separator = '&' if '?' in base_url else '?'
+    
+    # Generate verify_token at URL construction time since the page is hosted statically.
+    verify_token = _generate_verify_token(group_id, user_id)
+    
+    # Determine the bot's public base API URL for submitting verification payloads.
+    public_base = get_public_webapp_base_url()
+    if public_base:
+        api_verify_url = f"{public_base.rstrip('/')}/api/verify"
+    else:
+        api_verify_url = "/api/verify"
+
     # Include both snake_case and camelCase query keys for compatibility.
     url = (
         f"{base_url}{separator}group_id={group_id}"
         f"&tg_user_id={user_id}"
         f"&groupId={group_id}"
         f"&tgUserId={user_id}"
+        f"&verify_token={quote(verify_token, safe='')}"
+        f"&api_verify_url={quote(api_verify_url, safe='')}"
     )
 
     # Append SUI RPC URL so the mini-app can do client-side on-chain verification.
