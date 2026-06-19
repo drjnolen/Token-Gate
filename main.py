@@ -4518,18 +4518,19 @@ def build_wallet_connect_url(group_id, user_id, cfg=None):
     else:
         api_verify_url = "/api/verify"
 
-    # Include both snake_case and camelCase query keys for compatibility.
     url = (
         f"{base_url}{separator}group_id={group_id}"
         f"&tg_user_id={user_id}"
-        f"&groupId={group_id}"
-        f"&tgUserId={user_id}"
         f"&verify_token={quote(verify_token, safe='')}"
-        f"&api_verify_url={quote(api_verify_url, safe='')}"
     )
 
-    # Append SUI RPC URL so the mini-app can do client-side on-chain verification.
-    url += f"&sui_rpc={quote(SUI_RPC_URL, safe='')}"
+    # Only append api_verify_url if it differs from the static page's default.
+    if api_verify_url != "https://token-gate-bot-production.up.railway.app/api/verify":
+        url += f"&api_verify_url={quote(api_verify_url, safe='')}"
+
+    # Only append sui_rpc if it differs from the static page's default SUI RPC.
+    if SUI_RPC_URL != "https://fullnode.mainnet.sui.io:443":
+        url += f"&sui_rpc={quote(SUI_RPC_URL, safe='')}"
 
     if cfg:
         token = cfg.get("token", "")
