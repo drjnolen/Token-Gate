@@ -1447,18 +1447,10 @@ def check_user_wallets():
                                     cur.execute("DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id = %s", (group_id, user_id))
                                     cur.execute("DELETE FROM pending_verifications WHERE group_id = %s AND user_id = %s", (group_id, user_id))
                                 is_active_member = False
-                        except telebot.apihelper.ApiTelegramException as api_e:
-                            if any(phrase in str(api_e).lower() for phrase in ["user not found", "chat not found", "bot was kicked", "forbidden"]):
-                                logging.info(f"User {user_id} is no longer accessible in group {group_id} ({api_e}). Cleaning up database registration lazily.")
-                                with get_db_cursor() as (conn, cur):
-                                    cur.execute("DELETE FROM user_wallets WHERE group_id = %s AND user_id = %s", (group_id, user_id))
-                                    cur.execute("DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id = %s", (group_id, user_id))
-                                    cur.execute("DELETE FROM pending_verifications WHERE group_id = %s AND user_id = %s", (group_id, user_id))
-                                is_active_member = False
-                            else:
-                                logging.error(f"Error checking membership for user {user_id} in group {group_id}: {api_e}")
                         except Exception as e:
-                            logging.error(f"Error checking membership for user {user_id} in group {group_id}: {e}")
+                            # Log and skip membership check on failure. Do NOT delete user registration
+                            # on exceptions (like 'forbidden' or 'bot was kicked') to prevent accidental deletions.
+                            logging.warning(f"Could not verify membership status for user {user_id} in group {group_id}: {e}")
 
                         if not is_active_member:
                             continue
