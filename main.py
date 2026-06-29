@@ -92,7 +92,7 @@ BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', '0'))
 WHITELISTED_GROUPS: set[int] = {
     -1002461611839,
     -1003393402791,
-    -5265545062,
+    -1002484520072,
 }
 
 # Subscription pricing tiers (amount in cents)
