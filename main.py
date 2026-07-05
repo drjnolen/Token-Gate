@@ -1298,8 +1298,8 @@ def check_user_wallets():
                 if not user_regs:
                     continue
 
-                # 1. Fetch recent alerts for cooldown period
-                cooldown_threshold = datetime.datetime.now() - datetime.timedelta(days=ALERT_COOLDOWN_DAYS)
+                # 1. Fetch recent alerts for cooldown period (using UTC timezone-naive datetime to match database timestamps)
+                cooldown_threshold = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(days=ALERT_COOLDOWN_DAYS)
                 recent_alerts = {}
                 try:
                     with get_db_cursor() as (conn, cur):
@@ -1333,6 +1333,7 @@ def check_user_wallets():
 
                 # 4. Process users with the fetched data
                 below_users_to_alert = []
+                valid_user_ids = []
                 for reg in user_regs:
                     user_id = reg["user_id"]
 
@@ -1487,19 +1488,52 @@ def check_user_wallets():
                             if registration_mode == "token":
                                 failure_desc = f"{total_balance:,.2f} / {minimum_holding:,.2f} tokens"
                             elif registration_mode == "nft":
-                                if user_nft_count is not None:
-                                    failure_desc = f"{user_nft_count} / {nft_threshold} NFTs"
-                                else:
+                                if user_nft_count is None:
                                     failure_desc = "NFT check unavailable"
+                                elif user_nft_count < nft_threshold:
+                                    failure_desc = f"{user_nft_count} / {nft_threshold} NFTs"
+                                elif nft_trait_name and not trait_valid:
+                                    if nft_trait_value:
+                                        failure_desc = f"{user_trait_count or 0} / {nft_trait_threshold} NFTs with trait '{nft_trait_name}={nft_trait_value}'"
+                                    else:
+                                        failure_desc = f"{user_trait_count or 0} / {nft_trait_threshold} NFTs with trait '{nft_trait_name}'"
+                                else:
+                                    failure_desc = f"{user_nft_count} / {nft_threshold} NFTs"
                             else:  # "both"
-                                parts = [f"{total_balance:,.2f} tokens"]
-                                if user_nft_count is not None:
-                                    parts.append(f"{user_nft_count} NFTs")
-                                failure_desc = " | ".join(parts)
+                                # Token part
+                                token_part = f"{total_balance:,.2f} / {minimum_holding:,.2f} tokens"
+                                # NFT part
+                                if user_nft_count is None:
+                                    nft_part = "NFT check unavailable"
+                                elif user_nft_count < nft_threshold:
+                                    nft_part = f"{user_nft_count} / {nft_threshold} NFTs"
+                                elif nft_trait_name and not trait_valid:
+                                    if nft_trait_value:
+                                        nft_part = f"{user_trait_count or 0} / {nft_trait_threshold} '{nft_trait_name}={nft_trait_value}' NFTs"
+                                    else:
+                                        nft_part = f"{user_trait_count or 0} / {nft_trait_threshold} '{nft_trait_name}' NFTs"
+                                else:
+                                    nft_part = f"{user_nft_count} / {nft_threshold} NFTs"
+                                failure_desc = f"{token_part} | {nft_part}"
                             below_users_to_alert.append((user_id, failure_desc))
+                    else:
+                        valid_user_ids.append(user_id)
 
-                # 5. Send one consolidated alert for all users not on cooldown
-                if not auto_remove and below_users_to_alert:
+                # 4.5 Clear low balance alerts for users who now meet requirements
+                if valid_user_ids:
+                    try:
+                        with get_db_cursor() as (conn, cur):
+                            placeholders = ",".join(["%s"] * len(valid_user_ids))
+                            cur.execute(
+                                f"DELETE FROM low_balance_alerts WHERE group_id = %s AND user_id IN ({placeholders})",
+                                [group_id] + valid_user_ids
+                            )
+                            logging.info(f"Cleared {len(valid_user_ids)} stale low balance alerts for group {group_id}")
+                    except Exception as e:
+                        logging.error(f"Error clearing low balance alerts for group {group_id}: {e}")
+
+                # 5. Send one consolidated alert for all users not on cooldown (always alert when below_users_to_alert is not empty)
+                if below_users_to_alert:
                     user_list = []
                     for user_id, failure_desc in below_users_to_alert:
                         # Use the username already stored in the DB to avoid
