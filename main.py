@@ -42,6 +42,10 @@ BOT_LONG_POLLING_TIMEOUT = 10 # Bot long polling timeout (seconds)
 REMINDER_THRESHOLD = 1200   # Reminder threshold in seconds (20 minutes)
 VERIFICATION_TIMEOUT = 600  # Verification timeout in seconds (10 minute)
 ALERT_COOLDOWN_DAYS = 2 # Days before re-alerting a user with low balance
+# Alerts written by code before this version were recorded *before* Telegram
+# delivery was attempted.  Keep those rows out of the cooldown so each current
+# low-holdings user gets one retry under the delivery-safe implementation.
+ALERT_DELIVERY_VERSION = 1
 MAX_CACHE_SIZE = 1000  # Maximum number of entries in balance/NFT caches
 NFT_RPC_RETRY_DELAY = 2  # Seconds to wait before retrying an NFT RPC check
 DB_POOL_MIN = int(os.getenv('DB_POOL_MIN', '5'))  # Minimum database connections
@@ -581,6 +585,7 @@ def init_db():
             cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_trait_count INTEGER DEFAULT NULL")
             cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_token_balance REAL DEFAULT NULL")
             cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS holdings_updated_at TIMESTAMP DEFAULT NULL")
+            cur.execute("ALTER TABLE low_balance_alerts ADD COLUMN IF NOT EXISTS delivery_version INTEGER DEFAULT 0")
         except Exception as e:
             logging.error(f"Error adding new columns: {e}")
             conn.rollback()
@@ -1360,8 +1365,14 @@ def check_user_wallets():
                 try:
                     with get_db_cursor() as (conn, cur):
                         cur.execute(
-                            "SELECT user_id, alert_sent_at FROM low_balance_alerts WHERE group_id = %s AND alert_sent_at > %s", 
-                            (group_id, cooldown_threshold)
+                            """
+                            SELECT user_id, alert_sent_at
+                            FROM low_balance_alerts
+                            WHERE group_id = %s
+                              AND alert_sent_at > %s
+                              AND COALESCE(delivery_version, 0) = %s
+                            """,
+                            (group_id, cooldown_threshold, ALERT_DELIVERY_VERSION)
                         )
                         for user_id, alert_time in cur.fetchall():
                             recent_alerts[user_id] = alert_time
@@ -1425,13 +1436,23 @@ def check_user_wallets():
                                 )
                                 user_nft_count = len(fetched_nfts)
                             else:
-                                user_nft_count = get_user_nft_count(user_wallets_lower, nft_collection_id)
+                                # Periodic enforcement must not reuse a value
+                                # that was cached by a prior display request.
+                                # A 48-hour scan is infrequent enough to make a
+                                # fresh on-chain count the safer trade-off.
+                                user_nft_count = get_user_nft_count(
+                                    user_wallets_lower, nft_collection_id, use_cache=False
+                                )
 
                             if user_nft_count is None:
                                 logging.warning(f"Skipping NFT check for user {user_id} in group {group_id} due to API failure.")
                                 nft_valid = True  # Safety: don't penalize on API failure
                             else:
                                 nft_valid = user_nft_count >= nft_threshold
+                                logging.info(
+                                    f"NFT check for user {user_id} in group {group_id}: "
+                                    f"{user_nft_count} / {nft_threshold} NFTs"
+                                )
                         except Exception as nft_e:
                             logging.warning(f"NFT check API error for user {user_id}, allowing through: {nft_e}")
                             nft_valid = True  # Safety: don't penalize on API failure
@@ -1537,7 +1558,10 @@ def check_user_wallets():
                         else:
                             # Check if user is in alert cooldown period
                             if user_id in recent_alerts:
-                                logging.info(f"User {user_id} is in alert cooldown period. Skipping alert.")
+                                logging.info(
+                                    f"User {user_id} in group {group_id} is in the "
+                                    "delivered-alert cooldown period. Skipping alert."
+                                )
                                 continue
 
                             # Build a mode-appropriate description of what the user is missing
@@ -1609,13 +1633,18 @@ def check_user_wallets():
                         try:
                             with get_db_cursor() as (conn, cur):
                                 # Single batch INSERT with all users instead of N individual queries
-                                values_list = [(group_id, user_id) for user_id, _ in below_users_to_alert]
-                                placeholders = ",".join([f"(%s, %s)"] * len(values_list))
+                                values_list = [
+                                    (group_id, user_id, ALERT_DELIVERY_VERSION)
+                                    for user_id, _ in below_users_to_alert
+                                ]
+                                placeholders = ",".join([f"(%s, %s, %s)"] * len(values_list))
                                 flat_values = [item for pair in values_list for item in pair]
                                 cur.execute(f"""
-                                    INSERT INTO low_balance_alerts (group_id, user_id, alert_sent_at)
+                                    INSERT INTO low_balance_alerts (group_id, user_id, alert_sent_at, delivery_version)
                                     VALUES {placeholders}
-                                    ON CONFLICT (group_id, user_id) DO UPDATE SET alert_sent_at = NOW()
+                                    ON CONFLICT (group_id, user_id) DO UPDATE SET
+                                        alert_sent_at = NOW(),
+                                        delivery_version = EXCLUDED.delivery_version
                                 """, flat_values)
                                 logging.info(f"Batch inserted {len(below_users_to_alert)} low balance alerts for group {group_id}")
                         except Exception as e:
