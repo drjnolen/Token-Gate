@@ -1264,6 +1264,60 @@ def _fetch_staked_city_balance(address: str, decimals: int) -> float | None:
 
 
 # ==================== Periodic Tasks ==============================
+def send_low_holdings_alerts_to_admins(group_id, alert_entries):
+    """Send a low-holdings alert to a group's human administrators.
+
+    Returns ``True`` only when at least one administrator receives the alert.
+    This allows the caller to start the cooldown only after a real delivery,
+    rather than suppressing retries after a failed Telegram API request.
+    """
+    try:
+        admins = bot.get_chat_administrators(group_id)
+    except Exception as e:
+        logging.error(f"Could not get administrators for low-holdings alert in group {group_id}: {e}")
+        return False
+
+    try:
+        group_title = bot.get_chat(group_id).title or f"Group {group_id}"
+    except Exception as e:
+        # A title lookup should not prevent otherwise valid alerts from being
+        # delivered.  The numeric group ID is still useful to an admin.
+        logging.warning(f"Could not get title for low-holdings alert in group {group_id}: {e}")
+        group_title = f"Group {group_id}"
+
+    # Stored names may be first names rather than Telegram usernames, and
+    # group titles are arbitrary user input.  HTML escaping keeps a special
+    # character from invalidating every DM through parse-mode errors.
+    user_list = "\n".join(
+        f"<b>{html_module.escape(str(username))}</b>: {html_module.escape(str(failure_desc))}"
+        for username, failure_desc in alert_entries
+    )
+    message = (
+        f"🚨 <b>Low Holdings Alert for {html_module.escape(str(group_title))}:</b>\n\n"
+        f"{user_list}"
+    )
+
+    delivered_count = 0
+    for admin in admins:
+        if getattr(admin.user, "is_bot", False):
+            continue
+        try:
+            bot.send_message(admin.user.id, message, parse_mode="HTML")
+            delivered_count += 1
+        except Exception as admin_e:
+            logging.error(f"Failed to send low-holdings alert to admin {admin.user.id}: {admin_e}")
+
+    if delivered_count:
+        logging.info(
+            f"Delivered low-holdings alert for group {group_id} to "
+            f"{delivered_count} administrator(s)."
+        )
+        return True
+
+    logging.error(f"Low-holdings alert for group {group_id} was not delivered to any administrator.")
+    return False
+
+
 def check_user_wallets():
     """
     Efficiently checks all user wallets for a group in a single batch operation
@@ -1273,6 +1327,8 @@ def check_user_wallets():
         try:
             with config_lock:
                 configs = dict(SUBSCRIBER_CONFIGS)
+
+            logging.info(f"Starting periodic wallet check for {len(configs)} configured group(s).")
 
             for group_id, config in configs.items():
                 token = config.get("token")
@@ -1534,7 +1590,7 @@ def check_user_wallets():
 
                 # 5. Send one consolidated alert for all users not on cooldown (always alert when below_users_to_alert is not empty)
                 if below_users_to_alert:
-                    user_list = []
+                    alert_entries = []
                     for user_id, failure_desc in below_users_to_alert:
                         # Use the username already stored in the DB to avoid
                         # expensive per-user Telegram API calls.
@@ -1543,11 +1599,14 @@ def check_user_wallets():
                             username = reg_match["username"]
                         else:
                             username = f"User{user_id}"
-                        user_list.append(f"*{username}*: {failure_desc}")
+                        alert_entries.append((username, failure_desc))
 
-                    # Batch update the database for all users (reduces query count from N to 1)
-                    try:
-                        if below_users_to_alert:
+                    # Do not begin the alert cooldown until Telegram accepted
+                    # a DM for at least one administrator.  Previously this
+                    # happened before delivery, causing failed alerts to be
+                    # suppressed for the cooldown window.
+                    if send_low_holdings_alerts_to_admins(group_id, alert_entries):
+                        try:
                             with get_db_cursor() as (conn, cur):
                                 # Single batch INSERT with all users instead of N individual queries
                                 values_list = [(group_id, user_id) for user_id, _ in below_users_to_alert]
@@ -1559,23 +1618,21 @@ def check_user_wallets():
                                     ON CONFLICT (group_id, user_id) DO UPDATE SET alert_sent_at = NOW()
                                 """, flat_values)
                                 logging.info(f"Batch inserted {len(below_users_to_alert)} low balance alerts for group {group_id}")
-                    except Exception as e:
-                        logging.error(f"Error tracking alerts for group {group_id}: {e}")
-
-                    # Send alert to admins
-                    message = "🚨 *Low Holdings Alert*\n\n" + "\n".join(user_list)
-                    try:
-                        admins = bot.get_chat_administrators(group_id)
-                        for admin in admins:
-                            try:
-                                bot.send_message(admin.user.id, f"*Low Holdings Alert for {bot.get_chat(group_id).title}:*\n\n" + "\n".join(user_list), parse_mode='Markdown')
-                            except Exception as admin_e:
-                                logging.error(f"Failed to send alert to admin {admin.user.id}: {admin_e}")
-                    except Exception as e:
-                        logging.error(f"Error sending low balance alerts to admins for group {group_id}: {e}")
+                        except Exception as e:
+                            # A later duplicate is preferable to claiming an
+                            # alert was delivered when its cooldown was never
+                            # persisted.  Keep the failure visible in logs.
+                            logging.error(f"Error tracking delivered alerts for group {group_id}: {e}")
+                    else:
+                        logging.warning(
+                            f"Will retry low-holdings alert for group {group_id} on the next periodic check; "
+                            "no administrator DM was delivered."
+                        )
 
                 # Brief pause between groups to give the RPC endpoint breathing room.
                 time.sleep(GROUP_CHECK_DELAY)
+
+            logging.info("Completed periodic wallet check for all configured groups.")
 
         except Exception as e:
             logging.error(f"Error in user wallets check: {e}")
