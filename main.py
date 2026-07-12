@@ -3699,7 +3699,10 @@ def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=
         while True:
             rpc_result = sui_rpc_request(
                 "suix_getOwnedObjects",
-                [owner, query, cursor, 100],
+                # The public Sui RPC currently enforces a maximum page size
+                # of 50.  A larger request fails with -32602 and used to make
+                # periodic NFT checks fail open (therefore suppressing alerts).
+                [owner, query, cursor, 50],
                 max_retries=max_retries,
             )
             data = rpc_result.get("data", []) if rpc_result else []
