@@ -342,7 +342,7 @@
   const NFT_COLLECTION  = {{ js_nft_collection|safe }};
   const NFT_THRESHOLD   = {{ safe_nft_threshold|safe }};
   const API_VERIFY_URL  = {{ js_api_verify_url|safe }};
-  const VERIFY_TOKEN   = {{ js_verify_token|safe }};
+  const VERIFICATION_SESSION = {{ js_verification_session|safe }};
 
   /* ── State ── */
   let connectedAddress = '';
@@ -393,6 +393,10 @@
   /* ── Wallet address validation ── */
   function isValidSuiAddress(addr) {
     return /^0x[0-9a-fA-F]{40,64}$/.test((addr || '').trim());
+  }
+
+  function canonicalSuiAddress(addr) {
+    return '0x' + String(addr).trim().slice(2).toLowerCase().padStart(64, '0');
   }
 
   /* ── Update connected state ── */
@@ -637,7 +641,20 @@
       'sui:signPersonalMessage',
       'standard:signMessage',
     ];
-    const signMsg = 'Token Gate: verify wallet ownership for address ' + address;
+    const signMsg = 'Token Gate wallet ownership verification\n' +
+      'Session: ' + VERIFICATION_SESSION + '\n' +
+      'Telegram user: ' + TG_USER_ID + '\n' +
+      'Group: ' + GROUP_ID + '\n' +
+      'Wallet: ' + canonicalSuiAddress(address);
+    const asBase64 = function(value) {
+      if (typeof value === 'string') return value;
+      if (value instanceof Uint8Array) {
+        let binary = '';
+        value.forEach(function(byte) { binary += String.fromCharCode(byte); });
+        return btoa(binary);
+      }
+      return null;
+    };
     for (const key of signFeatureKeys) {
       const feat = wallet.features && wallet.features[key];
       if (!feat) continue;
@@ -650,7 +667,7 @@
           : { message: messageBytes };
         const sigResult = await signFn.call(feat, input);
         // sigResult.signature is base64-encoded; bytes may also be present
-        const sig = sigResult && (sigResult.signature || sigResult.bytes);
+        const sig = sigResult && asBase64(sigResult.signature || sigResult.bytes);
         if (sig) return { signature: sig, message: signMsg };
       } catch (e) {
         // Feature exists but signing failed (e.g. user rejected) — try next key.
@@ -661,7 +678,7 @@
       try {
         const messageBytes = new TextEncoder().encode(signMsg);
         const sigResult = await wallet._provider.signMessage({ message: messageBytes });
-        const sig = sigResult && (sigResult.signature || sigResult.bytes);
+        const sig = sigResult && asBase64(sigResult.signature || sigResult.bytes);
         if (sig) return { signature: sig, message: signMsg };
       } catch (e) {}
     }
@@ -789,11 +806,15 @@
         try {
           const { address, account, wallet: connectedWallet } = await connectToWallet(w);
 
-          // Ask the wallet to sign a message — this is the "SUI wallet sign-in" step.
-          // It proves the user actually controls the address (not just knows it).
+          // A signature is mandatory.  It binds this exact verification
+          // session to the connected address; the server verifies it before
+          // it records a wallet.
           hintEl.textContent = 'Sign to verify ownership…';
           const signResult = await signWalletOwnership(connectedWallet, account, address);
-          // signResult may be null if the wallet doesn't support signing; we still proceed.
+          if (!signResult) {
+            hintEl.textContent = 'This wallet did not provide an ownership signature.';
+            return;
+          }
 
           setConnectedWallet(address, signResult, w);
           el.classList.add('connected');
@@ -1265,6 +1286,12 @@
   async function startVerification() {
     const wallet = connectedAddress;
     if (!isValidSuiAddress(wallet)) return;
+    if (!VERIFICATION_SESSION || !walletSignResult || !walletSignResult.signature) {
+      const alert = document.getElementById('walletAlert');
+      alert.textContent = '❌ Please connect a wallet and approve its ownership signature first.';
+      alert.className = 'alert alert-error show';
+      return;
+    }
 
     $verifyBtn.disabled = true;
     document.getElementById('walletAlert').className = 'alert';
@@ -1301,7 +1328,7 @@
       nft_count: check.nftCount,
       wallet_signature: walletSignResult ? walletSignResult.signature : null,
       sign_message: walletSignResult ? walletSignResult.message : null,
-      verify_token: VERIFY_TOKEN
+      verification_session: VERIFICATION_SESSION
     };
 
     if (isWebApp) {

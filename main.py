@@ -2,7 +2,6 @@ import telebot
 import os
 import html as html_module
 import hashlib
-import hmac
 import logging
 import json
 import sys
@@ -11,6 +10,8 @@ import threading
 import requests
 import re
 import random
+import secrets
+import math
 from flask import Flask, jsonify, request, render_template
 from telebot import types
 import psycopg2
@@ -18,7 +19,7 @@ from psycopg2 import pool
 from logging.handlers import RotatingFileHandler
 from contextlib import contextmanager
 from io import StringIO, BytesIO
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 import csv
 import functools
 import datetime
@@ -27,6 +28,11 @@ import psutil
 import stripe
 from concurrent.futures import ThreadPoolExecutor
 from waitress import serve as waitress_serve
+from verification_security import (
+    build_wallet_ownership_message,
+    canonical_sui_address,
+    verify_sui_personal_message_signature,
+)
 
 # ==================== Refactored Module Imports ====================
 # HTML templates are in templates/ directory (Jinja2).
@@ -53,6 +59,9 @@ DB_POOL_MAX = int(os.getenv('DB_POOL_MAX', '15'))  # Maximum database connection
 TASK_JITTER_PERCENT = 0.1  # Add ±10% jitter to task intervals to prevent thundering herd
 WALLET_FETCH_DELAY = 0.05  # Seconds between per-wallet RPC calls to avoid burst traffic
 GROUP_CHECK_DELAY = 2     # Seconds between group checks to give the RPC endpoint breathing room
+SCHEDULER_LEASE_SECONDS = 300  # Recover quickly if a worker exits unexpectedly
+SCHEDULER_LEASE_RENEW_SECONDS = 60
+SCHEDULER_INSTANCE_ID = secrets.token_urlsafe(16)
 
 # ==================== Logging Setup ==============================
 file_handler = RotatingFileHandler("bot.log", maxBytes=5 * 1024 * 1024, backupCount=5)
@@ -115,9 +124,10 @@ INACTIVE_MEMBER_STATUS_MESSAGES = {
     "kicked": "❌ That user was removed from this group."
 }
 
-# Maximum age (in seconds) for verify-page tokens used to authenticate
-# requests coming from the bot's own /verify page.
-_VERIFY_TOKEN_MAX_AGE = 7200  # 2 hours
+# Verification sessions are server-stored, random, and single-use.  This is
+# deliberately short: a wallet-signature request should be completed while
+# the user is actively looking at the verification page.
+VERIFICATION_SESSION_TIMEOUT = 600  # 10 minutes
 
 
 def encode_group_id_for_deeplink(group_id):
@@ -143,82 +153,6 @@ def decode_group_id_from_deeplink(encoded):
     if encoded.startswith("n"):
         return -int(encoded[1:])
     return int(encoded)
-
-
-def _generate_verify_token(group_id, user_id):
-    """Create an HMAC-signed token proving a request originates from the /verify page.
-
-    The token encodes group_id, user_id and a timestamp.  It is embedded in
-    the page at render time and sent back with the verification payload so
-    the server can confirm the request came from a genuine page load.
-    """
-    ts = str(int(time.time()))
-    msg = f"{group_id}:{user_id}:{ts}"
-    # BOT_TOKEN is required for the bot to start; this fallback is
-    # purely defensive and will never execute at runtime.
-    secret = (BOT_TOKEN or "").encode("utf-8")
-    sig = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
-    return f"{msg}:{sig}"
-
-
-def _validate_verify_token(token, group_id, user_id, max_age=None):
-    """Validate a signed verify-page token.
-
-    Returns ``True`` when the token is well-formed, the HMAC is correct,
-    the embedded group/user IDs match, and the token has not expired.
-    """
-    if max_age is None:
-        max_age = _VERIFY_TOKEN_MAX_AGE
-    try:
-        if not token:
-            return False
-        parts = token.rsplit(":", 1)
-        if len(parts) != 2:
-            return False
-        msg, sig = parts
-        # msg = "group_id:user_id:ts"
-        msg_parts = msg.split(":")
-        if len(msg_parts) != 3:
-            return False
-        tok_group, tok_user, tok_ts = msg_parts
-        if str(group_id) != tok_group or str(user_id) != tok_user:
-            return False
-        if time.time() - int(tok_ts) > max_age:
-            return False
-        secret = (BOT_TOKEN or "").encode("utf-8")
-        expected_sig = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(sig, expected_sig)
-    except Exception:
-        return False
-
-
-def _apply_verify_token_fallback(requirement_eval, balance_verified, verify_token, group_id, user_id, context_label):
-    """Accept the client-side verification when the backend RPC fails and the
-    request carries a valid page-session token.
-
-    Returns the (possibly updated) *requirement_eval* dict.
-    """
-    if (
-        requirement_eval.get('rpc_failed')
-        and not requirement_eval['requirements_met']
-        and balance_verified
-        and _validate_verify_token(verify_token, group_id, user_id)
-    ):
-        logging.warning(
-            f"{context_label}: server-side RPC failed for user {user_id}, "
-            f"group {group_id} — accepting client-side verification (valid page token)"
-        )
-        # Clean up details to show that they passed via client-side check
-        old_details = requirement_eval.get('details', [])
-        new_details = []
-        for d in old_details:
-            if "⚠️ check failed" in d:
-                d = d.replace("⚠️ check failed", "✓ passed (verified client-side)")
-            elif "⚠️ Check failed" in d:
-                d = d.replace("⚠️ Check failed", "✓ passed (verified client-side)")
-            new_details.append(d)
-        return {"requirements_met": True, "details": new_details, "errors": []}
-    return requirement_eval
 
 
 if not BOT_TOKEN:
@@ -388,7 +322,13 @@ def get_connection_pool():
                 connection_string = connection_string + f"{separator}options=endpoint%3D{endpoint_id}"
                 logging.info(f"Added Neon endpoint parameter: {endpoint_id}")
 
-        logging.info(f"Final connection string (masked): {connection_string.split('@')[0]}@[MASKED]")
+        # Never log a connection URL: its user-info section contains the
+        # database password.  Host metadata is sufficient for diagnostics.
+        parsed_connection = urlsplit(connection_string)
+        safe_target = parsed_connection.hostname or "unknown-host"
+        if parsed_connection.port:
+            safe_target = f"{safe_target}:{parsed_connection.port}"
+        logging.info(f"Database connection target: {parsed_connection.scheme}://{safe_target} (credentials redacted)")
 
         tries = 0
         max_tries = 5
@@ -547,6 +487,16 @@ def init_db():
             )
         """)
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS verification_sessions (
+                session_id TEXT PRIMARY KEY,
+                group_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                consumed_at TIMESTAMP DEFAULT NULL
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
                 group_id BIGINT PRIMARY KEY,
                 stripe_session_id TEXT,
@@ -562,11 +512,19 @@ def init_db():
                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS scheduler_leases (
+                lease_name TEXT PRIMARY KEY,
+                holder_id TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL
+            )
+        """)
         # Create indexes for frequently queried columns to optimize performance
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_wallets_user ON user_wallets(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_voting_polls_group ON voting_polls(group_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_voting_polls_active ON voting_polls(is_active) WHERE is_active = TRUE")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_verifications_created_at ON pending_verifications(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_verification_sessions_expiry ON verification_sessions(expires_at)")
         try:
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS auto_remove BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_collection_id TEXT DEFAULT ''")
@@ -966,6 +924,58 @@ def activate_subscription(group_id, stripe_session_id, tier, activated_by):
     logging.info(f"Subscription activated for group {group_id}: tier={tier}, expires={new_expiry}")
     return new_expiry
 
+
+@db_retry
+def activate_subscription_from_stripe(group_id, stripe_session_id, tier, activated_by):
+    """Atomically claim a Stripe checkout session and extend a subscription.
+
+    Stripe can deliver the same event concurrently.  The event claim and the
+    expiry calculation must therefore happen in one database transaction;
+    checking first and inserting later can grant the same purchase twice.
+    Returns ``(new_expiry, processed_now)``.
+    """
+    tier_info = SUBSCRIPTION_TIERS.get(tier)
+    if not tier_info:
+        raise ValueError(f"Unknown subscription tier: {tier}")
+    if not stripe_session_id:
+        raise ValueError("Stripe session ID is required")
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "INSERT INTO stripe_processed_events (session_id) VALUES (%s) ON CONFLICT DO NOTHING RETURNING session_id",
+            (stripe_session_id,),
+        )
+        if cur.fetchone() is None:
+            return None, False
+
+        # Lock the group row while computing its extension point, so two
+        # different valid purchases for one group cannot overwrite each other.
+        cur.execute("SELECT expires_at FROM subscriptions WHERE group_id = %s FOR UPDATE", (group_id,))
+        row = cur.fetchone()
+        existing_expiry = row[0] if row else None
+        if existing_expiry and existing_expiry.tzinfo is None:
+            existing_expiry = existing_expiry.replace(tzinfo=datetime.timezone.utc)
+        new_expiry = (
+            existing_expiry + datetime.timedelta(days=tier_info["days"])
+            if existing_expiry and existing_expiry > now
+            else now + datetime.timedelta(days=tier_info["days"])
+        )
+        cur.execute(
+            """
+            INSERT INTO subscriptions (group_id, stripe_session_id, tier, activated_at, expires_at, activated_by)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (group_id) DO UPDATE SET
+                stripe_session_id = EXCLUDED.stripe_session_id,
+                tier = EXCLUDED.tier,
+                activated_at = EXCLUDED.activated_at,
+                expires_at = EXCLUDED.expires_at,
+                activated_by = EXCLUDED.activated_by
+            """,
+            (group_id, stripe_session_id, tier, now, new_expiry, activated_by),
+        )
+    return new_expiry, True
+
 def create_stripe_checkout_session(group_id, user_id, tier):
     """Create a Stripe Checkout Session for a subscription purchase."""
     if not STRIPE_SECRET_KEY:
@@ -1071,6 +1081,61 @@ balance_cache = {}
 nft_cache = {}
 last_registration_prompt = {}
 
+
+@db_retry
+def create_verification_session(group_id, user_id):
+    """Create an expiring, single-use wallet verification session."""
+    session_id = secrets.token_urlsafe(32)
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            INSERT INTO verification_sessions (session_id, group_id, user_id, expires_at)
+            VALUES (%s, %s, %s, NOW() + (%s * INTERVAL '1 second'))
+            """,
+            (session_id, group_id, user_id, VERIFICATION_SESSION_TIMEOUT),
+        )
+    return session_id
+
+
+@db_retry
+def get_active_verification_session(session_id):
+    """Return an unconsumed, unexpired verification session, if one exists."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            SELECT group_id, user_id
+            FROM verification_sessions
+            WHERE session_id = %s AND consumed_at IS NULL AND expires_at > NOW()
+            """,
+            (session_id,),
+        )
+        row = cur.fetchone()
+    if row:
+        return {"group_id": row[0], "user_id": row[1]}
+    return None
+
+
+@db_retry
+def consume_verification_session(session_id, group_id, user_id):
+    """Atomically consume a session after its wallet signature was validated."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            UPDATE verification_sessions
+            SET consumed_at = NOW()
+            WHERE session_id = %s
+              AND group_id = %s
+              AND user_id = %s
+              AND consumed_at IS NULL
+              AND expires_at > NOW()
+            RETURNING session_id
+            """,
+            (session_id, group_id, user_id),
+        )
+        return cur.fetchone() is not None
+
 # ==================== Cleanup Functions =============================
 def cleanup_expired_data():
     """Clean up expired registrations, verifications, and prompts"""
@@ -1088,12 +1153,15 @@ def cleanup_expired_data():
     for key in expired_polls:
         del poll_creation_context[key]
 
-    # Clean up expired pending verifications from the database
+    # Clean up expired pending verification contexts and sessions from the database.
     try:
         with get_db_cursor() as (conn, cur):
             cur.execute("DELETE FROM pending_verifications WHERE created_at < NOW() - INTERVAL '%s seconds'", (VERIFICATION_TIMEOUT,))
             if cur.rowcount > 0:
                 logging.info(f"Cleaned up {cur.rowcount} expired pending verifications from DB.")
+            cur.execute("DELETE FROM verification_sessions WHERE expires_at < NOW() - INTERVAL '1 day'")
+            if cur.rowcount > 0:
+                logging.info(f"Cleaned up {cur.rowcount} expired verification sessions from DB.")
     except Exception as e:
         logging.error(f"Error cleaning up expired verifications from DB: {e}")
 
@@ -1323,19 +1391,73 @@ def send_low_holdings_alerts_to_admins(group_id, alert_entries):
     return False
 
 
+@db_retry
+def refresh_wallet_scheduler_lease():
+    """Acquire or renew the cross-process periodic-check lease."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            INSERT INTO scheduler_leases (lease_name, holder_id, expires_at)
+            VALUES ('wallet_checks', %s, NOW() + (%s * INTERVAL '1 second'))
+            ON CONFLICT (lease_name) DO UPDATE SET
+                holder_id = EXCLUDED.holder_id,
+                expires_at = EXCLUDED.expires_at
+            WHERE scheduler_leases.expires_at < NOW()
+               OR scheduler_leases.holder_id = EXCLUDED.holder_id
+            RETURNING holder_id
+            """,
+            (SCHEDULER_INSTANCE_ID, SCHEDULER_LEASE_SECONDS),
+        )
+        return cur.fetchone() is not None
+
+
+def sleep_while_holding_wallet_scheduler_lease(seconds):
+    """Sleep in short intervals while renewing the scheduler lease."""
+    remaining = seconds
+    while remaining > 0:
+        time.sleep(min(SCHEDULER_LEASE_RENEW_SECONDS, remaining))
+        remaining -= SCHEDULER_LEASE_RENEW_SECONDS
+        if not refresh_wallet_scheduler_lease():
+            logging.warning("Lost periodic wallet-check lease while waiting; another worker may take over.")
+            return False
+    return True
+
+
 def check_user_wallets():
     """
     Efficiently checks all user wallets for a group in a single batch operation
     and implements a cooldown period for alerts to avoid spamming admins.
     """
+    retry_group_items = None
     while True:
+        group_items = []
+        group_index = -1
         try:
+            if not refresh_wallet_scheduler_lease():
+                logging.info("Another worker holds the periodic wallet-check lease; waiting before retrying.")
+                time.sleep(SCHEDULER_LEASE_RENEW_SECONDS)
+                continue
+
             with config_lock:
                 configs = dict(SUBSCRIBER_CONFIGS)
 
             logging.info(f"Starting periodic wallet check for {len(configs)} configured group(s).")
 
-            for group_id, config in configs.items():
+            # If a previous group raised unexpectedly, immediately continue
+            # with the later groups instead of delaying every one until the
+            # next scheduled (up to 48-hour) scan.
+            group_items = retry_group_items if retry_group_items is not None else list(configs.items())
+            retry_group_items = None
+            for group_index, (group_id, config) in enumerate(group_items):
+                if not refresh_wallet_scheduler_lease():
+                    logging.warning("Lost periodic wallet-check lease during scan; stopping this scan safely.")
+                    break
+                # Expired subscriptions disable every enforcement action.  Keep
+                # the saved configuration so an admin can renew without having
+                # to rebuild it, but do not scan, alert, or remove members.
+                if not group_has_active_subscription(group_id):
+                    logging.info(f"Skipping periodic gate enforcement for expired-subscription group {group_id}.")
+                    continue
                 token = config.get("token")
                 minimum_holding = config.get("minimum_holding", 5000000)
                 decimals = config.get("decimals", 6)
@@ -1664,12 +1786,23 @@ def check_user_wallets():
             logging.info("Completed periodic wallet check for all configured groups.")
 
         except Exception as e:
-            logging.error(f"Error in user wallets check: {e}")
+            group_label = group_items[group_index][0] if 0 <= group_index < len(group_items) else "setup"
+            logging.exception(f"Error in periodic wallet check for group {group_label}: {e}")
+            if group_index >= 0:
+                retry_group_items = group_items[group_index + 1:] or None
+
+        if retry_group_items is not None:
+            logging.info(
+                f"Continuing periodic wallet scan with {len(retry_group_items)} unaffected group(s) "
+                "after a group-specific failure."
+            )
+            time.sleep(GROUP_CHECK_DELAY)
+            continue
         # Add jitter to prevent all groups checking at the same time
         jitter = SLEEP_BETWEEN_TASKS * TASK_JITTER_PERCENT * (2 * random.random() - 1)
         sleep_time = SLEEP_BETWEEN_TASKS + jitter
         logging.info(f"Next user wallets check in {sleep_time:.0f}s (base: {SLEEP_BETWEEN_TASKS}s, jitter: {jitter:+.0f}s)")
-        time.sleep(sleep_time)
+        sleep_while_holding_wallet_scheduler_lease(sleep_time)
 
 # ==================== Bot Handlers ================================
 def is_group_admin(message):
@@ -2981,8 +3114,12 @@ def process_set_token_config(message, group_id):
     try:
         threshold = float(threshold_str)
         decimals = int(decimals_str)
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Invalid threshold or decimals value. Please ensure they are numbers.")
+        if not math.isfinite(threshold) or threshold < 0:
+            raise ValueError("threshold must be a finite non-negative number")
+        if decimals < 0 or decimals > 18:
+            raise ValueError("decimals out of range")
+    except (ValueError, OverflowError):
+        bot.send_message(message.chat.id, "❌ Threshold must be a finite non-negative number and decimals must be between 0 and 18.")
         return
 
     # Validate SUI token type format: 0x<hex>::<module>::<Type>
@@ -3009,8 +3146,10 @@ def process_set_nft_collection(message, group_id):
 def process_set_nft_threshold(message, group_id):
     try:
         threshold = int(message.text.strip())
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Invalid NFT threshold value. Please enter a number.")
+        if threshold < 1:
+            raise ValueError("threshold must be positive")
+    except (ValueError, OverflowError):
+        bot.send_message(message.chat.id, "❌ Invalid NFT threshold. Please enter a positive integer.")
         return
     with config_lock:
         ensure_config_exists(group_id)
@@ -3087,7 +3226,7 @@ def process_set_votes_per_million(message, group_id):
 def process_set_vote_duration(message, group_id):
     try:
         hours = float(message.text.strip())
-        if hours <= 0:
+        if not math.isfinite(hours) or hours <= 0:
             raise ValueError("Duration must be positive")
         # Convert hours to seconds
         duration = int(hours * 3600)
@@ -4408,7 +4547,16 @@ def handle_chat_member_update(update):
             minimum_holding = config.get("minimum_holding", 0)
             nft_collection_id = config.get("nft_collection_id", "")
             nft_threshold = config.get("nft_threshold", 1)
+            nft_trait_name = config.get("nft_trait_name", "")
+            nft_trait_value = config.get("nft_trait_value", "")
+            nft_trait_threshold = config.get("nft_trait_threshold", 1)
             registration_mode = config.get("registration_mode", "token")
+
+            # A lapsed subscription disables the gate; do not prompt or
+            # evaluate existing registrations until it is renewed.
+            if not group_has_active_subscription(group_id):
+                logging.info(f"Skipping join-time gate enforcement for expired-subscription group {group_id}.")
+                return
 
             # If user has wallets, validate they meet current requirements
             if user_reg and user_reg["wallets"]:
@@ -4418,7 +4566,7 @@ def handle_chat_member_update(update):
 
                     token_valid = False
                     nft_valid = False
-                    trait_valid = True  # Defaults to True; trait enforcement only in evaluate_wallet_requirements
+                    trait_valid = True
                     if registration_mode in ["token", "both"] and token:
                         balances = fetch_wallet_balances(wallet_addresses, token, decimals)
                         total_balance = sum(balances.get(addr, 0) or 0 for addr in wallet_addresses)
@@ -4427,6 +4575,34 @@ def handle_chat_member_update(update):
                     # Check NFT requirements if applicable
                     if registration_mode in ["nft", "both"] and nft_collection_id:
                         nft_valid = check_nft_ownership(wallet_addresses, nft_collection_id, nft_threshold)
+                        if nft_valid and nft_trait_name:
+                            try:
+                                if nft_trait_value:
+                                    trait_count = get_user_nft_trait_count(
+                                        wallet_addresses, nft_collection_id,
+                                        nft_trait_name, nft_trait_value,
+                                        use_cache=False,
+                                    )
+                                else:
+                                    trait_count = get_user_nft_category_count(
+                                        wallet_addresses, nft_collection_id,
+                                        nft_trait_name,
+                                        use_cache=False,
+                                    )
+                                # Fail open only when the chain query was
+                                # unavailable.  A real below-threshold count
+                                # must prompt the returning member to verify.
+                                if trait_count is not None:
+                                    trait_valid = trait_count >= nft_trait_threshold
+                                    if not trait_valid:
+                                        logging.info(
+                                            f"Returning user {user_id} fails trait gate in group {group_id}: "
+                                            f"{trait_count} / {nft_trait_threshold}"
+                                        )
+                            except Exception as trait_e:
+                                logging.warning(
+                                    f"Could not evaluate trait gate for returning user {user_id}; allowing through: {trait_e}"
+                                )
 
                     # Determine if requirements are met
                     requirements_met = False
@@ -4610,8 +4786,7 @@ def handle_start(message):
         bot.reply_to(message, "👋 Welcome to CityWatch! Use /help to see available commands.")
 
 def build_wallet_connect_url(group_id, user_id, cfg=None):
-    """Build a verification URL pointing to the static verify page on alphacity.tech
-    or a custom configured base URL.
+    """Build a session-bound URL for the hosted verification page.
 
     When *cfg* is provided the group's token/NFT requirements are appended as
     query parameters so the verify page knows what to check:
@@ -4624,16 +4799,18 @@ def build_wallet_connect_url(group_id, user_id, cfg=None):
       - nft_threshold     : minimum NFT count required
       - sui_rpc           : SUI RPC endpoint for client-side on-chain queries
     """
-    # Use the static hosted page as the default.
-    base_url = "https://alphacity.tech/verify"
-    override_url = globals().get("WALLET_CONNECT_URL") or os.getenv('WALLET_CONNECT_URL', '').strip()
-    if override_url:
-        base_url = override_url
+    # Always use the bot's own deployed /verify page so the page and server
+    # share the same single-use-session protocol.  The previous optional
+    # WALLET_CONNECT_URL could point at a stale static page, which would make
+    # a secure server deployment reject the old client payload.  Deploy a
+    # separate instance with PUBLIC_WEBAPP_BASE_URL when self-hosting is
+    # needed; do not split the page from its verification server.
+    public_base = get_public_webapp_base_url()
+    base_url = f"{public_base.rstrip('/')}/verify" if public_base else FALLBACK_VERIFY_URL
 
     separator = '&' if '?' in base_url else '?'
     
-    # Generate verify_token at URL construction time since the page is hosted statically.
-    verify_token = _generate_verify_token(group_id, user_id)
+    verification_session = create_verification_session(group_id, user_id)
     
     # Determine the bot's public base API URL for submitting verification payloads.
     public_base = get_public_webapp_base_url()
@@ -4643,9 +4820,9 @@ def build_wallet_connect_url(group_id, user_id, cfg=None):
         api_verify_url = "/api/verify"
 
     url = (
-        f"{base_url}{separator}group_id={group_id}"
+        f"{base_url}{separator}verification_session={quote(verification_session, safe='')}"
+        f"&group_id={group_id}"
         f"&tg_user_id={user_id}"
-        f"&verify_token={quote(verify_token, safe='')}"
     )
 
     # Only append api_verify_url if it differs from the static page's default.
@@ -4786,47 +4963,28 @@ def handle_wallet_webapp_data(message):
         or (payload.get('data') or {}).get('walletAddress')
         or ''
     ).strip()
-    payload_group_id = (
-        payload.get('group_id')
-        or payload.get('groupId')
-        or (payload.get('data') or {}).get('group_id')
-        or (payload.get('data') or {}).get('groupId')
-    )
-
-    # Extract verification result fields sent by the verify page.
-    # The mini-app performs on-chain balance/NFT checks client-side and sends
-    # the results here via tg.sendData().
-    balance_verified = payload.get('balance_verified')
-    if balance_verified is None:
-        balance_verified = (payload.get('data') or {}).get('balance_verified')
-    token_type = payload.get('token_type') or (payload.get('data') or {}).get('token_type') or ''
-    required_balance = payload.get('required_balance') or (payload.get('data') or {}).get('required_balance')
-    token_balance = payload.get('token_balance') or (payload.get('data') or {}).get('token_balance')
-    nft_count = payload.get('nft_count')
-    if nft_count is None:
-        nft_count = (payload.get('data') or {}).get('nft_count')
-    verify_token_val = payload.get('verify_token') or (payload.get('data') or {}).get('verify_token') or ''
+    payload_data = payload.get('data') or {}
+    verification_session = payload.get('verification_session') or payload_data.get('verification_session') or ''
+    wallet_signature = payload.get('wallet_signature') or payload_data.get('wallet_signature') or ''
 
     if not is_valid_wallet_address(wallet_address):
         bot.reply_to(message, "❌ Wallet verification failed: invalid wallet payload from WebApp.")
         return
+    wallet_address = canonical_sui_address(wallet_address)
 
-    group_id = None
-    if payload_group_id:
-        try:
-            group_id = int(payload_group_id)
-        except Exception:
-            group_id = None
+    session = get_active_verification_session(verification_session)
+    if not session or session["user_id"] != user_id:
+        bot.reply_to(message, "❌ This verification link is invalid, expired, or belongs to another Telegram user. Please run /register again.")
+        return
+    group_id = session["group_id"]
 
-    if group_id is None:
-        with get_db_cursor() as (conn, cur):
-            cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (user_id,))
-            row = cur.fetchone()
-        if row:
-            group_id = row[0]
-
-    if group_id is None:
-        bot.reply_to(message, "❌ No registration context found. Please run /register in the target group first.")
+    try:
+        ownership_message = build_wallet_ownership_message(verification_session, group_id, user_id, wallet_address)
+    except (ValueError, OverflowError):
+        bot.reply_to(message, "❌ Wallet verification failed: invalid Sui wallet address.")
+        return
+    if not verify_sui_personal_message_signature(wallet_address, ownership_message, wallet_signature):
+        bot.reply_to(message, "❌ Wallet ownership signature could not be verified. Please reconnect your wallet and sign the verification message.")
         return
 
     if wallet_already_registered(wallet_address, group_id, user_id=user_id):
@@ -4839,25 +4997,13 @@ def handle_wallet_webapp_data(message):
         bot.reply_to(message, "❌ This group isn't set up yet. Ask an admin to run /cwconfig first.")
         return
 
-    # Always perform authoritative server-side verification regardless of what
-    # the client-side mini-app reports.  The mini-app does a client-side check
-    # purely for UX (instant feedback) but the bot must not trust it for access
-    # control since tg.sendData() content is user-controlled.
-    if balance_verified:
-        logging.info(
-            f"Mini-app reported client-side verification for user {user_id}, wallet {wallet_address}: "
-            f"token_type={token_type}, required_balance={required_balance}, "
-            f"token_balance={token_balance}, nft_count={nft_count} — re-verifying server-side"
-        )
-    requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
+    if not consume_verification_session(verification_session, group_id, user_id):
+        bot.reply_to(message, "❌ This verification link has already been used or expired. Please run /register again.")
+        return
 
-    # Fallback: when the server-side RPC check fails but the client already
-    # verified successfully via a genuine /verify page load, accept the
-    # result instead of showing a confusing error.
-    requirement_eval = _apply_verify_token_fallback(
-        requirement_eval, balance_verified, verify_token_val, group_id, user_id,
-        "handle_wallet_webapp_data"
-    )
+    # The client-side check is only a UX preview.  Holdings are always checked
+    # against the server's configured RPC endpoint.
+    requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
 
     # Always save / update the wallet so the user's database record reflects
     # the current registration mode and wallet list, even when requirements
@@ -4875,17 +5021,11 @@ def handle_wallet_webapp_data(message):
         bot.reply_to(message, "❌ Failed to save your wallet. Please try again later.")
         return
 
-    # Persist any on-chain counts returned by the requirement evaluation
-    # (or from the client-side payload when the fallback was used) so the
-    # "View Wallets" display has data even when later RPC lookups fail.
+    # Persist any authoritative on-chain counts so the "View Wallets" display
+    # has data even when later RPC lookups fail.
     _nft = requirement_eval.get("nft_count")
     _trait = requirement_eval.get("trait_count")
     _bal = requirement_eval.get("token_balance")
-    if _nft is None and nft_count is not None:
-        try:
-            _nft = int(nft_count)
-        except (ValueError, TypeError):
-            pass
     if _nft is not None or _trait is not None or _bal is not None:
         try:
             update_user_cached_holdings(group_id, user_id, nft_count=_nft, trait_count=_trait, token_balance=_bal)
@@ -4982,7 +5122,7 @@ def _add_cors_headers(response):
     """
     response.headers['Access-Control-Allow-Origin'] = CORS_ALLOWED_ORIGIN
     response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Webhook-Secret'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
 
 
@@ -5008,53 +5148,30 @@ def wallet_connect_webapp():
     ``tg.sendData()``.  An external-browser fallback (POST to /api/verify)
     is kept for edge cases.
     """
-    group_id = request.args.get('group_id', '') or request.args.get('groupId', '')
-    tg_user_id = request.args.get('tg_user_id', '') or request.args.get('tgUserId', '')
+    verification_session = request.args.get('verification_session', '')
+    session = get_active_verification_session(verification_session)
+    if not session:
+        return "This verification link is invalid, expired, or was already used. Please run /register again.", 400
 
-    # Sanitize to digits-only to prevent XSS – these are numeric IDs.
-    safe_group_id = re.sub(r'[^0-9\-]', '', group_id)
-    safe_tg_user_id = re.sub(r'[^0-9\-]', '', tg_user_id)
+    group_id = session["group_id"]
+    tg_user_id = session["user_id"]
+    with config_lock:
+        cfg = dict(SUBSCRIBER_CONFIGS.get(group_id, {}))
+    if not cfg:
+        return "This group is no longer configured. Please ask an administrator for help.", 400
 
-    # JSON-encoded strings for safe embedding in JavaScript literals.
-    js_group_id = json.dumps(safe_group_id)
-    js_tg_user_id = json.dumps(safe_tg_user_id)
-
-    # Extract requirement params passed by build_wallet_connect_url().
-    raw_sui_rpc = request.args.get('sui_rpc', SUI_RPC_URL)
-    # Only allow HTTPS URLs for the client-side RPC endpoint.  The client-side
-    # check is purely for UX (instant feedback) — the server always re-verifies
-    # via its own trusted SUI_RPC_URL, so a tampered client RPC cannot bypass
-    # access control.
-    if not re.match(r'^https://', raw_sui_rpc):
-        raw_sui_rpc = SUI_RPC_URL
-    js_sui_rpc = json.dumps(raw_sui_rpc)
-
-    raw_token_type = request.args.get('token_type', '')
-    # Sanitize token_type: allow hex, colons, and alphanumeric (SUI type format).
-    safe_token_type = re.sub(r'[^0-9a-zA-Z:_]', '', raw_token_type)
-    js_token_type = json.dumps(safe_token_type)
-
-    raw_required_balance = request.args.get('required_balance', '0')
-    safe_required_balance = re.sub(r'[^0-9]', '', raw_required_balance) or '0'
-    raw_decimals = request.args.get('decimals', '6')
-    safe_decimals = re.sub(r'[^0-9]', '', raw_decimals) or '6'
-    raw_minimum_holding = request.args.get('minimum_holding', '0')
-    safe_minimum_holding = re.sub(r'[^0-9.]', '', raw_minimum_holding) or '0'
-
-    raw_reg_mode = request.args.get('registration_mode', 'token')
-    safe_reg_mode = re.sub(r'[^a-z]', '', raw_reg_mode) or 'token'
-    js_reg_mode = json.dumps(safe_reg_mode)
-
-    raw_nft_collection = request.args.get('nft_collection_id', '')
-    # Normalise the collection identifier so it works with both full type
-    # strings (0xPACKAGE::module::Struct) and plain hex addresses.
-    safe_nft_collection = _normalize_collection_id(raw_nft_collection)
-    # Sanitise: only allow characters valid in SUI addresses / type strings
-    safe_nft_collection = re.sub(r'[^0-9a-zA-Z_:]', '', safe_nft_collection)
-    js_nft_collection = json.dumps(safe_nft_collection)
-
-    raw_nft_threshold = request.args.get('nft_threshold', '1')
-    safe_nft_threshold = re.sub(r'[^0-9]', '', raw_nft_threshold) or '1'
+    # Every value rendered into the page comes from the server-side session and
+    # configuration; query parameters are never an authority for requirements.
+    js_group_id = json.dumps(str(group_id))
+    js_tg_user_id = json.dumps(str(tg_user_id))
+    js_sui_rpc = json.dumps(SUI_RPC_URL)
+    js_token_type = json.dumps(cfg.get("token", ""))
+    safe_decimals = int(cfg.get("decimals", 6))
+    safe_minimum_holding = cfg.get("minimum_holding", 0)
+    safe_required_balance = int(round(float(safe_minimum_holding) * (10 ** safe_decimals)))
+    js_reg_mode = json.dumps(cfg.get("registration_mode", "token"))
+    js_nft_collection = json.dumps(_normalize_collection_id(cfg.get("nft_collection_id", "")))
+    safe_nft_threshold = max(1, int(cfg.get("nft_threshold", 1)))
 
     # Build absolute API URL for the external-browser fallback path.
     public_base = get_public_webapp_base_url()
@@ -5064,10 +5181,7 @@ def wallet_connect_webapp():
         api_verify_url = "/api/verify"
     js_api_verify_url = json.dumps(api_verify_url)
 
-    # Generate a signed token so api_verify / handle_wallet_webapp_data can
-    # confirm the request originated from a genuine /verify page load.
-    verify_token = _generate_verify_token(safe_group_id, safe_tg_user_id)
-    js_verify_token = json.dumps(verify_token)
+    js_verification_session = json.dumps(verification_session)
 
     # Render the verify page from the Jinja2 template.
     html = render_template(
@@ -5083,7 +5197,7 @@ def wallet_connect_webapp():
         js_nft_collection=js_nft_collection,
         safe_nft_threshold=safe_nft_threshold,
         js_api_verify_url=js_api_verify_url,
-        js_verify_token=js_verify_token,
+        js_verification_session=js_verification_session,
     )
     return html
 
@@ -5097,12 +5211,9 @@ def api_verify():
     validates the wallet, saves it, and sends the confirmation (plus an invite
     link) to the user via the Telegram bot.
 
-    External websites (e.g. token-gate-bot-production.up.railway.app/api/verify) can also call this endpoint
-    directly from their server or browser after a successful wallet verification,
-    without needing the user to manually run /register in Telegram.  To bypass
-    the on-chain requirement check and trust the website's own verification,
-    include the shared secret in an X-Webhook-Secret request header (set the
-    WEBHOOK_SECRET environment variable on both sides).
+    A valid, unconsumed server session and a Sui personal-message signature are
+    both required.  Group, Telegram user, and on-chain result fields supplied
+    by the browser are not trusted as authority.
     """
     # Handle CORS preflight so browser-side calls from external domains succeed.
     if request.method == 'OPTIONS':
@@ -5112,52 +5223,32 @@ def api_verify():
     try:
         data = request.get_json(silent=True) or {}
 
-        # Validate webhook secret when provided.  A correct secret tells us the
-        # call came from the trusted external website, so we can skip the
-        # redundant on-chain requirement check (the website already did it).
-        provided_secret = request.headers.get('X-Webhook-Secret', '')
-        webhook_authenticated = (
-            bool(WEBHOOK_SECRET)
-            and bool(provided_secret)
-            and hmac.compare_digest(
-                provided_secret.encode('utf-8'),
-                WEBHOOK_SECRET.encode('utf-8'),
-            )
-        )
-
         wallet_address = (
             data.get('wallet_address') or data.get('walletAddress') or ''
         ).strip()
-
-        try:
-            group_id = int(data.get('group_id') or data.get('groupId') or 0)
-        except (ValueError, TypeError):
-            group_id = 0
-
-        try:
-            tg_user_id = int(data.get('tg_user_id') or data.get('tgUserId') or 0)
-        except (ValueError, TypeError):
-            tg_user_id = 0
+        verification_session = data.get('verification_session') or data.get('verificationSession') or ''
+        wallet_signature = data.get('wallet_signature') or data.get('walletSignature') or ''
 
         if not is_valid_wallet_address(wallet_address):
             resp = jsonify({'success': False, 'error': 'Invalid wallet address'})
             return _add_cors_headers(resp), 400
+        wallet_address = canonical_sui_address(wallet_address)
 
-        if not tg_user_id:
-            resp = jsonify({'success': False, 'error': 'Missing Telegram user ID'})
+        session = get_active_verification_session(verification_session)
+        if not session:
+            resp = jsonify({'success': False, 'error': 'Verification link is invalid, expired, or already used. Please run /register again.'})
             return _add_cors_headers(resp), 400
+        group_id = session['group_id']
+        tg_user_id = session['user_id']
 
-        # Look up group_id from pending_verifications if not supplied
-        if not group_id:
-            with get_db_cursor() as (conn, cur):
-                cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (tg_user_id,))
-                row = cur.fetchone()
-            if row:
-                group_id = row[0]
-
-        if not group_id:
-            resp = jsonify({'success': False, 'error': 'No registration context found. Please run /register in the target group first.'})
+        try:
+            ownership_message = build_wallet_ownership_message(verification_session, group_id, tg_user_id, wallet_address)
+        except ValueError:
+            resp = jsonify({'success': False, 'error': 'Invalid wallet address'})
             return _add_cors_headers(resp), 400
+        if not verify_sui_personal_message_signature(wallet_address, ownership_message, wallet_signature):
+            resp = jsonify({'success': False, 'error': 'Wallet ownership signature could not be verified.'})
+            return _add_cors_headers(resp), 403
 
         if wallet_already_registered(wallet_address, group_id, user_id=tg_user_id):
             resp = jsonify({'success': False, 'error': 'Wallet already registered to another user in this group'})
@@ -5177,32 +5268,14 @@ def api_verify():
             resp = jsonify({'success': False, 'error': 'Group is not configured. Ask an admin to run /cwconfig first.'})
             return _add_cors_headers(resp), 400
 
-        # When the call comes from the trusted external website (valid webhook
-        # secret), trust its verification result and skip a redundant RPC check.
-        # Otherwise run the on-chain requirement evaluation ourselves.
-        if webhook_authenticated:
-            requirement_eval = {"requirements_met": True, "details": [], "errors": []}
-            source_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-            logging.info(
-                f"api_verify: webhook callback accepted from {source_ip} for user {tg_user_id}, "
-                f"wallet {wallet_address}, group {group_id}"
-            )
-        else:
-            # Brief pause to let SUI RPC rate-limits recover after the client-
-            # side verification that just completed (the verify page makes
-            # several RPC calls before posting here).
-            time.sleep(1)
-            requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
+        if not consume_verification_session(verification_session, group_id, tg_user_id):
+            resp = jsonify({'success': False, 'error': 'Verification link has already been used or expired. Please run /register again.'})
+            return _add_cors_headers(resp), 409
 
-            # Fallback: when the server-side RPC check fails (e.g. rate-
-            # limiting after the client already hit the same RPC) but the
-            # request carries a valid page-session token AND the client
-            # reported that its own on-chain check passed, accept the result
-            # rather than showing a confusing "Unable to verify" error.
-            requirement_eval = _apply_verify_token_fallback(
-                requirement_eval, data.get('balance_verified'), data.get('verify_token', ''),
-                group_id, tg_user_id, "api_verify"
-            )
+        # Brief pause to let Sui RPC rate limits recover after the client-side
+        # preview.  Its result is intentionally never trusted for access.
+        time.sleep(1)
+        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
 
         # Resolve display name (best-effort)
         username = _get_user_display_name(tg_user_id)
@@ -5215,19 +5288,10 @@ def api_verify():
             resp = jsonify({'success': False, 'error': 'Failed to save wallet. Please try again later.'})
             return _add_cors_headers(resp), 500
 
-        # Persist any on-chain counts returned by the requirement evaluation
-        # (or from the client-side payload when the fallback was used) so the
-        # "View Wallets" display has data even when later RPC lookups fail.
+        # Persist authoritative on-chain counts for later display fallback.
         _nft = requirement_eval.get("nft_count")
         _trait = requirement_eval.get("trait_count")
         _bal = requirement_eval.get("token_balance")
-        # When server-side RPC failed but client payload was accepted via the
-        # verify-token fallback, use the client-reported nft_count instead.
-        if _nft is None and data.get("nft_count") is not None:
-            try:
-                _nft = int(data["nft_count"])
-            except (ValueError, TypeError):
-                pass
         if _nft is not None or _trait is not None or _bal is not None:
             try:
                 update_user_cached_holdings(group_id, tg_user_id, nft_count=_nft, trait_count=_trait, token_balance=_bal)
@@ -5314,14 +5378,6 @@ def stripe_webhook():
         session_data = event["data"]["object"]
         stripe_session_id = session_data.get("id", "")
 
-        # Idempotency check: skip if this session was already processed
-        if stripe_session_id:
-            with get_db_cursor() as (conn, cur):
-                cur.execute("SELECT 1 FROM stripe_processed_events WHERE session_id = %s", (stripe_session_id,))
-                if cur.fetchone():
-                    logging.info(f"Stripe session {stripe_session_id} already processed, skipping")
-                    return jsonify({"status": "ok"})
-
         metadata = session_data.get("metadata", {})
         group_id_str = metadata.get("group_id")
         user_id_str = metadata.get("user_id")
@@ -5331,16 +5387,13 @@ def stripe_webhook():
             try:
                 group_id = int(group_id_str)
                 user_id = int(user_id_str) if user_id_str else 0
-                new_expiry = activate_subscription(group_id, stripe_session_id, tier, user_id)
+                new_expiry, processed_now = activate_subscription_from_stripe(
+                    group_id, stripe_session_id, tier, user_id
+                )
+                if not processed_now:
+                    logging.info(f"Stripe session {stripe_session_id} already processed, skipping")
+                    return jsonify({"status": "ok"})
                 logging.info(f"Stripe payment completed: group={group_id}, tier={tier}, expires={new_expiry}")
-
-                # Record this session as processed for idempotency
-                if stripe_session_id:
-                    with get_db_cursor() as (conn, cur):
-                        cur.execute(
-                            "INSERT INTO stripe_processed_events (session_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                            (stripe_session_id,),
-                        )
 
                 # Notify the user via Telegram
                 if user_id:
