@@ -11,11 +11,16 @@ import base64
 import hashlib
 import hmac
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, utils
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
 
 SUI_ED25519_SCHEME_FLAG = 0
+SUI_SECP256K1_SCHEME_FLAG = 1
+SUI_SECP256R1_SCHEME_FLAG = 2
 _SUI_PERSONAL_MESSAGE_INTENT = b"\x03\x00\x00"
 
 
@@ -71,11 +76,12 @@ def build_wallet_ownership_message(session_id: str, group_id: int, user_id: int,
 
 
 def verify_sui_personal_message_signature(address: str, message: str, serialized_signature: str) -> bool:
-    """Verify an Ed25519 Sui ``signPersonalMessage`` signature.
+    """Verify a Sui ``signPersonalMessage`` signature.
 
     The public key embedded in the serialized signature is also used to derive
     the Sui address.  Therefore a valid signature for a different wallet is
-    not sufficient to register the submitted address.
+    not sufficient to register the submitted address.  Sui's Ed25519,
+    secp256k1, and secp256r1 single-key account schemes are supported.
     """
     expected_address = canonical_sui_address(address)
     if not expected_address or not isinstance(message, str) or not isinstance(serialized_signature, str):
@@ -85,16 +91,40 @@ def verify_sui_personal_message_signature(address: str, message: str, serialized
     except (ValueError, TypeError):
         return False
 
-    # Sui Ed25519: 1-byte scheme flag, 64-byte signature, 32-byte public key.
-    if len(raw) != 97 or raw[0] != SUI_ED25519_SCHEME_FLAG:
+    if len(raw) < 66:
         return False
+    scheme_flag = raw[0]
     signature = raw[1:65]
     public_key = raw[65:]
-    actual_address = "0x" + hashlib.blake2b(raw[:1] + public_key, digest_size=32).hexdigest()
+    if scheme_flag == SUI_ED25519_SCHEME_FLAG:
+        if len(public_key) != 32:
+            return False
+    elif scheme_flag in (SUI_SECP256K1_SCHEME_FLAG, SUI_SECP256R1_SCHEME_FLAG):
+        # SEC1 compressed public keys are 33 bytes for both curves.
+        if len(public_key) != 33:
+            return False
+    else:
+        return False
+
+    actual_address = "0x" + hashlib.blake2b(bytes([scheme_flag]) + public_key, digest_size=32).hexdigest()
     if not hmac.compare_digest(expected_address, actual_address):
         return False
+    digest = sui_personal_message_digest(message)
     try:
-        VerifyKey(public_key).verify(sui_personal_message_digest(message), signature)
+        if scheme_flag == SUI_ED25519_SCHEME_FLAG:
+            VerifyKey(public_key).verify(digest, signature)
+            return True
+
+        curve = ec.SECP256K1() if scheme_flag == SUI_SECP256K1_SCHEME_FLAG else ec.SECP256R1()
+        key = ec.EllipticCurvePublicKey.from_encoded_point(curve, public_key)
+        r = int.from_bytes(signature[:32], "big")
+        s = int.from_bytes(signature[32:], "big")
+        der_signature = utils.encode_dss_signature(r, s)
+        key.verify(
+            der_signature,
+            digest,
+            ec.ECDSA(utils.Prehashed(hashes.SHA256())),
+        )
         return True
-    except (BadSignatureError, ValueError, TypeError):
+    except (BadSignatureError, InvalidSignature, ValueError, TypeError):
         return False
