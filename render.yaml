@@ -4,6 +4,7 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
+    healthCheckPath: /health
     # Render exposes the PORT env var; main.py already reads it (default 5000).
     # The public URL is available as RENDER_EXTERNAL_URL, which main.py uses
     # to build the /verify WebApp URL when WALLET_CONNECT_URL is not set.
@@ -14,24 +15,31 @@ services:
       - key: DATABASE_URL
         sync: false          # Set this secret in the Render dashboard
       # ── Optional / recommended ─────────────────────────────────────────────
-      # Leave WALLET_CONNECT_URL empty so the bot serves /verify from its own URL.
       - key: WALLET_CONNECT_URL
         value: ""
+      - key: WALLET_CONNECT_ALLOWED_HOSTS
+        value: alphacity.tech,www.alphacity.tech
       # RENDER_EXTERNAL_URL is injected automatically by Render.
       # PUBLIC_WEBAPP_BASE_URL is only needed if you want to override it.
       - key: PUBLIC_WEBAPP_BASE_URL
         value: ""
-      # Shared secret used to authenticate webhook callbacks to /api/verify.
-      - key: WEBHOOK_SECRET
+      - key: CORS_ALLOWED_ORIGINS
+        value: https://alphacity.tech,https://www.alphacity.tech
+      # Supply one or more production GraphQL providers, separated by commas.
+      # The code falls back to Mysten's rate-limited public endpoint for dev.
+      - key: SUI_GRAPHQL_URLS
         sync: false
-      # CORS origin for /api/verify. "*" is safe (credential-free API).
-      - key: CORS_ALLOWED_ORIGIN
-        value: "*"
-      # Sui RPC endpoint (defaults to Mysten mainnet).
-      - key: SUI_RPC_URL
-        value: https://fullnode.mainnet.sui.io:443
+      # Optional: use Telegram webhooks instead of the lease-protected poller.
+      - key: TELEGRAM_WEBHOOK_URL
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
       # Database connection pool size (tune to your Render plan).
       - key: DB_POOL_MIN
         value: "2"
       - key: DB_POOL_MAX
         value: "10"
+      - key: SUI_FETCH_WORKERS
+        value: "8"
+      - key: WALLET_CHECK_INTERVAL_SECONDS
+        value: "172800"

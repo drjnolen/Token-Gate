@@ -1,4 +1,4 @@
-"""Regression guards for security-critical paths in the monolithic bot module.
+"""Regression guards for security-critical bot paths.
 
 The application initializes its production database and Telegram client at
 import time, so these tests intentionally inspect the parsed function bodies
@@ -24,9 +24,99 @@ class EnforcementRegressionGuards(unittest.TestCase):
         for name in ("api_verify", "handle_wallet_webapp_data"):
             source = FUNCTIONS[name]
             self.assertIn("get_active_verification_session", source)
-            self.assertIn("verify_sui_personal_message_signature", source)
-            self.assertIn("consume_verification_session", source)
+            self.assertIn("sui_gateway.verify_personal_message", source)
+            self.assertIn("claim_verification_session", source)
+            self.assertIn("finalize_verified_wallet", source)
+            self.assertIn("release_verification_session", source)
             self.assertNotIn("_apply_verify_token_fallback", source)
+
+    def test_sessions_are_retryable_and_wallet_completion_is_atomic(self):
+        claim = FUNCTIONS["claim_verification_session"]
+        self.assertIn("status = 'processing'", claim)
+        self.assertIn("INTERVAL '2 minutes'", claim)
+        finalize = FUNCTIONS["finalize_verified_wallet"]
+        self.assertIn("_save_wallet_for_user_with_cursor", finalize)
+        self.assertIn("status = 'completed'", finalize)
+        self.assertIn("FOR UPDATE", finalize)
+
+    def test_runtime_and_browser_have_no_json_rpc_transport(self):
+        runtime = Path("main.py").read_text(encoding="utf-8")
+        template = Path("templates/verify.html").read_text(encoding="utf-8")
+        for forbidden in (
+            "SUI_RPC_URL",
+            "sui_rpc_request",
+            "suix_",
+            "sui_getObject",
+            '"jsonrpc"',
+            "'jsonrpc'",
+        ):
+            self.assertNotIn(forbidden, runtime)
+            self.assertNotIn(forbidden, template)
+
+    def test_browser_submits_only_session_wallet_and_signature(self):
+        template = Path("templates/verify.html").read_text(encoding="utf-8")
+        self.assertIn("verification_session: VERIFICATION_SESSION", template)
+        self.assertIn("wallet_address: selectedAddress", template)
+        self.assertIn("wallet_signature: selectedSignature", template)
+        self.assertNotIn("balance_verified", template)
+        self.assertNotIn("token_balance:", template)
+        self.assertNotIn("nft_count:", template)
+
+    def test_admission_checks_are_tri_state(self):
+        source = FUNCTIONS["evaluate_wallet_requirements"]
+        self.assertIn('"indeterminate"', source)
+        self.assertIn('"pass"', source)
+        self.assertIn('"fail"', source)
+        self.assertIn("trait_indeterminate = True", source)
+        self.assertIn('"status": status', source)
+
+    def test_wallet_uniqueness_uses_normalized_database_table(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE IF NOT EXISTS user_wallet_addresses", source)
+        self.assertIn("UNIQUE (group_id, wallet_address)", source)
+        self.assertIn("FROM user_wallet_addresses", FUNCTIONS["wallet_already_registered"])
+
+    def test_graphql_move_json_trait_shapes_are_supported(self):
+        namespace = {}
+        exec(FUNCTIONS["_extract_traits"], namespace)
+        extract_traits = namespace["_extract_traits"]
+        obj = {
+            "content": {
+                "fields": {
+                    "attributes": {
+                        "contents": [
+                            {"key": "Rarity", "value": "Legendary"},
+                        ]
+                    }
+                }
+            }
+        }
+        self.assertEqual(extract_traits(obj), {"rarity": "legendary"})
+        direct = {
+            "content": {
+                "fields": {
+                    "attributes": {"Faction": "Civic"},
+                }
+            }
+        }
+        self.assertEqual(extract_traits(direct), {"faction": "civic"})
+
+    def test_graphql_personal_kiosk_cap_shape_is_supported(self):
+        namespace = {}
+        exec(FUNCTIONS["_extract_kiosk_id_from_personal_cap"], namespace)
+        extract_kiosk = namespace["_extract_kiosk_id_from_personal_cap"]
+        obj = {
+            "content": {
+                "fields": {
+                    "cap": {
+                        "vec": [
+                            {"for": "0xkiosk"},
+                        ]
+                    }
+                }
+            }
+        }
+        self.assertEqual(extract_kiosk(obj), "0xkiosk")
 
     def test_returning_member_trait_gate_is_checked(self):
         source = FUNCTIONS["handle_chat_member_update"]
