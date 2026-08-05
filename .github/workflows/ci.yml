@@ -18,8 +18,10 @@ jobs:
           python-version-file: .python-version
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r requirements.txt pip-audit==2.10.1
-      - run: python -m compileall -q main.py verification_security.py sui_gateway.py runtime_support.py tests
+      - run: python -m pip install -r requirements.txt pip-audit==2.10.1 ruff==0.12.12
+      - run: python -m compileall -q main.py verification_security.py enforcement_policy.py sui_gateway.py runtime_support.py tests
+      - run: node --check static/verify.js
+      - run: ruff check .
       - run: python -m unittest discover -s tests -v
       - run: python -m pip check
       - run: pip-audit -r requirements.txt

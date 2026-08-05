@@ -1,5 +1,6 @@
 import base64
 from collections import defaultdict, deque
+import time
 import unittest
 
 import requests
@@ -12,9 +13,10 @@ from sui_gateway import (
 
 
 class FakeResponse:
-    def __init__(self, payload, status_code=200):
+    def __init__(self, payload, status_code=200, headers=None):
         self._payload = payload
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -186,6 +188,74 @@ class SuiGraphQLGatewayTests(unittest.TestCase):
         session.queue("https://one.example/graphql", requests.Timeout("timeout"))
         with self.assertRaises(SuiGatewayError):
             self.gateway(session).chain_identifier()
+
+    def test_open_circuit_fails_fast_instead_of_reprobing_immediately(self):
+        session = FakeSession()
+        session.queue("https://one.example/graphql", requests.Timeout("timeout"))
+        gateway = self.gateway(session)
+        with self.assertRaises(SuiGatewayError):
+            gateway.chain_identifier()
+        with self.assertRaisesRegex(SuiGatewayError, "circuit"):
+            gateway.chain_identifier()
+        self.assertEqual(len(session.calls), 1)
+
+    def test_expired_operation_deadline_makes_no_network_request(self):
+        session = FakeSession()
+        gateway = self.gateway(session)
+        with self.assertRaisesRegex(SuiGatewayError, "deadline"):
+            gateway.execute(
+                gateway.CHAIN_IDENTIFIER_QUERY,
+                operation_name="chain identifier",
+                deadline_monotonic=time.monotonic() - 1,
+            )
+        self.assertEqual(session.calls, [])
+        self.assertEqual(gateway.provider_status()[0]["failures"], 0)
+
+    def test_owned_object_item_budget_prevents_unbounded_collection(self):
+        session = FakeSession()
+        session.queue(
+            "https://one.example/graphql",
+            FakeResponse({
+                "data": {
+                    "address": {
+                        "objects": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "address": "0xa",
+                                    "contents": {
+                                        "type": {"repr": "0x1::nft::Item"},
+                                        "json": {},
+                                    },
+                                },
+                                {
+                                    "address": "0xb",
+                                    "contents": {
+                                        "type": {"repr": "0x1::nft::Item"},
+                                        "json": {},
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                }
+            }),
+        )
+        with self.assertRaisesRegex(SuiGatewayError, "item safety limit"):
+            self.gateway(session).list_owned_objects("0x1", max_items=1)
+
+    def test_provider_status_does_not_expose_endpoint_credentials(self):
+        session = FakeSession()
+        gateway = self.gateway(
+            session,
+            ("https://secret-user:secret-pass@one.example/graphql?apiKey=secret",),
+        )
+        status = gateway.provider_status()
+        serialized = repr(status)
+        self.assertNotIn("secret-user", serialized)
+        self.assertNotIn("secret-pass", serialized)
+        self.assertNotIn("apiKey", serialized)
+        self.assertIn("one.example", serialized)
 
 
 if __name__ == "__main__":

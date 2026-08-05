@@ -21,7 +21,7 @@ FUNCTIONS = {
 
 class EnforcementRegressionGuards(unittest.TestCase):
     def test_verification_paths_require_server_session_and_wallet_signature(self):
-        for name in ("api_verify", "handle_wallet_webapp_data"):
+        for name in ("api_verify",):
             source = FUNCTIONS[name]
             self.assertIn("get_active_verification_session", source)
             self.assertIn("sui_gateway.verify_personal_message", source)
@@ -38,10 +38,20 @@ class EnforcementRegressionGuards(unittest.TestCase):
         self.assertIn("_save_wallet_for_user_with_cursor", finalize)
         self.assertIn("status = 'completed'", finalize)
         self.assertIn("FOR UPDATE", finalize)
+        attempts = FUNCTIONS["consume_verification_attempt"]
+        self.assertIn("attempt_count = attempt_count + 1", attempts)
+        self.assertIn("attempt_count < %s", attempts)
+        self.assertIn(
+            "consume_verification_attempt(verification_session)",
+            FUNCTIONS["api_verify"],
+        )
 
     def test_runtime_and_browser_have_no_json_rpc_transport(self):
         runtime = Path("main.py").read_text(encoding="utf-8")
-        template = Path("templates/verify.html").read_text(encoding="utf-8")
+        browser = (
+            Path("templates/verify.html").read_text(encoding="utf-8")
+            + Path("static/verify.js").read_text(encoding="utf-8")
+        )
         for forbidden in (
             "SUI_RPC_URL",
             "sui_rpc_request",
@@ -51,22 +61,49 @@ class EnforcementRegressionGuards(unittest.TestCase):
             "'jsonrpc'",
         ):
             self.assertNotIn(forbidden, runtime)
-            self.assertNotIn(forbidden, template)
+            self.assertNotIn(forbidden, browser)
 
     def test_browser_submits_only_session_wallet_and_signature(self):
+        browser = Path("static/verify.js").read_text(encoding="utf-8")
+        self.assertIn("verification_session: VERIFICATION_SESSION", browser)
+        self.assertIn("wallet_address: selectedAddress", browser)
+        self.assertIn("wallet_signature: selectedSignature", browser)
+        self.assertNotIn("balance_verified", browser)
+        self.assertNotIn("token_balance:", browser)
+        self.assertNotIn("nft_count:", browser)
+
+    def test_verification_ux_separates_connect_review_sign_and_submit(self):
         template = Path("templates/verify.html").read_text(encoding="utf-8")
-        self.assertIn("verification_session: VERIFICATION_SESSION", template)
-        self.assertIn("wallet_address: selectedAddress", template)
-        self.assertIn("wallet_signature: selectedSignature", template)
-        self.assertNotIn("balance_verified", template)
-        self.assertNotIn("token_balance:", template)
-        self.assertNotIn("nft_count:", template)
+        browser = Path("static/verify.js").read_text(encoding="utf-8")
+        self.assertIn('id="accountPanel"', template)
+        self.assertIn('id="ownershipMessage"', template)
+        self.assertIn('id="signButton"', template)
+        self.assertIn('id="submitButton"', template)
+        self.assertIn("renderAccounts(accounts)", browser)
+        connect_index = browser.index("const accounts = await connectWallet(wallet)")
+        sign_index = browser.index("signButton.addEventListener")
+        self.assertLess(connect_index, sign_index)
+        self.assertIn("Wallet registered — requirements not met", browser)
+
+    def test_verification_page_uses_fragment_tokens_and_external_assets(self):
+        runtime = Path("main.py").read_text(encoding="utf-8")
+        template = Path("templates/verify.html").read_text(encoding="utf-8")
+        browser = Path("static/verify.js").read_text(encoding="utf-8")
+        styles = Path("static/verify.css").read_text(encoding="utf-8")
+        self.assertIn("base_url != local_base_url", FUNCTIONS["build_wallet_connect_url"])
+        self.assertIn("else '#'", FUNCTIONS["build_wallet_connect_url"])
+        self.assertIn("window.location.hash", browser)
+        self.assertIn("window.history.replaceState", browser)
+        self.assertIn('/static/verify.css', template)
+        self.assertIn('/static/verify.js', template)
+        self.assertNotIn("<style>", template)
+        self.assertNotIn("'unsafe-inline'", template)
+        self.assertNotIn("'unsafe-inline'", runtime)
+        self.assertIn("[hidden] { display: none !important; }", styles)
 
     def test_admission_checks_are_tri_state(self):
         source = FUNCTIONS["evaluate_wallet_requirements"]
-        self.assertIn('"indeterminate"', source)
-        self.assertIn('"pass"', source)
-        self.assertIn('"fail"', source)
+        self.assertIn("evaluate_gate(", source)
         self.assertIn("trait_indeterminate = True", source)
         self.assertIn('"status": status', source)
 
@@ -134,6 +171,38 @@ class EnforcementRegressionGuards(unittest.TestCase):
         self.assertIn("refresh_wallet_scheduler_lease", source)
         self.assertIn("retry_group_items", source)
         self.assertIn("Continuing periodic wallet scan", source)
+
+    def test_enforcement_unknown_flags_are_reset_for_each_user(self):
+        source = FUNCTIONS["check_user_wallets"]
+        loop_index = source.index("for reg in user_regs:")
+        nft_reset = source.index("nft_indeterminate = False", loop_index)
+        trait_reset = source.index("trait_indeterminate = False", loop_index)
+        first_read = source.index(
+            "nft_indeterminate=nft_indeterminate",
+            loop_index,
+        )
+        self.assertLess(nft_reset, first_read)
+        self.assertLess(trait_reset, first_read)
+
+    def test_auto_removal_has_grace_fresh_recheck_and_unban(self):
+        source = FUNCTIONS["check_user_wallets"]
+        self.assertIn("decide_auto_removal", source)
+        self.assertIn("use_cache=False", source)
+        self.assertIn("unban_chat_member", source)
+        self.assertIn("only_if_banned=True", source)
+
+    def test_vote_weight_failure_is_retryable_and_first_weight_is_immutable(self):
+        handler = FUNCTIONS["handle_poll_vote"]
+        calculator = FUNCTIONS["calculate_user_vote_weight"]
+        self.assertIn("HoldingsUnavailableError", handler)
+        self.assertIn("holdings are temporarily unavailable", handler)
+        self.assertIn("HoldingsUnavailableError", calculator)
+        self.assertNotIn("balances.get(addr, 0)", calculator)
+        self.assertNotIn("vote_weight=EXCLUDED.vote_weight", handler)
+
+    def test_poller_lease_thread_binds_its_stop_event(self):
+        source = FUNCTIONS["start_polling"]
+        self.assertIn("def renew_poller_lease(stop_event=lease_stop)", source)
 
     def test_stripe_session_claim_and_expiry_extension_share_one_transaction(self):
         source = FUNCTIONS["activate_subscription_from_stripe"]

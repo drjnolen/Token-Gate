@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import base64
 import logging
+import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
+from urllib.parse import urlsplit
 
 import requests
 
@@ -22,6 +24,10 @@ DEFAULT_SUI_GRAPHQL_URL = "https://graphql.mainnet.sui.io/graphql"
 
 class SuiGatewayError(RuntimeError):
     """Base class for indeterminate Sui provider results."""
+
+
+class SuiDeadlineExceeded(SuiGatewayError):
+    """The caller's overall operation budget expired."""
 
 
 class SuiGraphQLError(SuiGatewayError):
@@ -150,8 +156,15 @@ class SuiGraphQLGateway:
         self.max_retries = max(1, max_retries)
         self.circuit_failures = max(1, circuit_failures)
         self.circuit_cooldown_seconds = max(1.0, circuit_cooldown_seconds)
-        self.session = session or requests.Session()
-        self.session.headers.update(
+        self._provided_session = session
+        self._thread_local = threading.local()
+        if session is not None:
+            self._configure_session(session)
+        self._states = {endpoint: _ProviderState() for endpoint in self.endpoints}
+        self._state_lock = threading.Lock()
+
+    def _configure_session(self, session: requests.Session) -> None:
+        session.headers.update(
             {
                 "Content-Type": "application/json",
                 "User-Agent": "CityWatchBot/3.0",
@@ -161,21 +174,34 @@ class SuiGraphQLGateway:
             pool_connections=max(4, len(self.endpoints) * 2),
             pool_maxsize=20,
         )
-        self.session.mount("https://", adapter)
-        self._states = {endpoint: _ProviderState() for endpoint in self.endpoints}
-        self._state_lock = threading.Lock()
+        session.mount("https://", adapter)
+
+    def _session_for_thread(self) -> requests.Session:
+        if self._provided_session is not None:
+            return self._provided_session
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._configure_session(session)
+            self._thread_local.session = session
+        return session
 
     def _available_endpoints(self) -> list[str]:
         now = time.monotonic()
         with self._state_lock:
-            available = [
+            return [
                 endpoint
                 for endpoint in self.endpoints
                 if self._states[endpoint].open_until <= now
             ]
-        # If every provider is open, probe all of them.  A circuit breaker
-        # should shed load during partial failures, not create a total outage.
-        return available or list(self.endpoints)
+
+    def _circuit_retry_after(self) -> float:
+        now = time.monotonic()
+        with self._state_lock:
+            return max(
+                0.0,
+                min(state.open_until for state in self._states.values()) - now,
+            )
 
     def _record_success(self, endpoint: str) -> None:
         with self._state_lock:
@@ -194,16 +220,43 @@ class SuiGraphQLGateway:
         variables: dict[str, Any] | None = None,
         *,
         operation_name: str,
+        deadline_monotonic: float | None = None,
     ) -> dict[str, Any]:
         """Execute one operation, failing over only for indeterminate errors."""
+        if (
+            deadline_monotonic is not None
+            and deadline_monotonic <= time.monotonic()
+        ):
+            raise SuiDeadlineExceeded(
+                f"Sui GraphQL {operation_name} operation deadline exceeded"
+            )
         last_error: Exception | None = None
-        for endpoint in self._available_endpoints():
+        endpoints = self._available_endpoints()
+        if not endpoints:
+            retry_after = self._circuit_retry_after()
+            raise SuiGatewayError(
+                "All Sui GraphQL providers are circuit-open; "
+                f"retry in {retry_after:.1f}s"
+            )
+
+        for endpoint in endpoints:
             for attempt in range(self.max_retries):
                 try:
-                    response = self.session.post(
+                    if deadline_monotonic is None:
+                        request_timeout = self.timeout_seconds
+                    else:
+                        request_timeout = min(
+                            self.timeout_seconds,
+                            deadline_monotonic - time.monotonic(),
+                        )
+                        if request_timeout <= 0:
+                            raise SuiDeadlineExceeded(
+                                f"Sui GraphQL {operation_name} operation deadline exceeded"
+                            )
+                    response = self._session_for_thread().post(
                         endpoint,
                         json={"query": query, "variables": variables or {}},
-                        timeout=(5, self.timeout_seconds),
+                        timeout=(min(5.0, request_timeout), request_timeout),
                     )
                     response.raise_for_status()
                     payload = response.json()
@@ -234,6 +287,8 @@ class SuiGraphQLGateway:
                     }:
                         raise
                     last_error = exc
+                except SuiDeadlineExceeded:
+                    raise
                 except (
                     requests.RequestException,
                     ValueError,
@@ -243,7 +298,27 @@ class SuiGraphQLGateway:
 
                 self._record_failure(endpoint)
                 if attempt + 1 < self.max_retries:
-                    time.sleep(min(0.25 * (2**attempt), 1.0))
+                    delay = min(0.25 * (2**attempt), 1.0)
+                    response = getattr(last_error, "response", None)
+                    retry_after = (
+                        getattr(response, "headers", {}).get("Retry-After")
+                        if response is not None
+                        else None
+                    )
+                    if retry_after:
+                        try:
+                            delay = min(max(float(retry_after), 0.0), 10.0)
+                        except (TypeError, ValueError):
+                            pass
+                    delay *= random.uniform(0.8, 1.2)
+                    if deadline_monotonic is not None:
+                        remaining = deadline_monotonic - time.monotonic()
+                        if remaining <= 0:
+                            raise SuiDeadlineExceeded(
+                                f"Sui GraphQL {operation_name} operation deadline exceeded"
+                            ) from last_error
+                        delay = min(delay, remaining)
+                    time.sleep(delay)
             logging.warning(
                 "Sui GraphQL provider %s failed during %s: %s",
                 endpoint,
@@ -268,11 +343,18 @@ class SuiGraphQLGateway:
             },
         }
 
-    def get_balance_atomic(self, owner: str, coin_type: str) -> int:
+    def get_balance_atomic(
+        self,
+        owner: str,
+        coin_type: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> int:
         data = self.execute(
             self.BALANCE_QUERY,
             {"owner": owner, "coinType": coin_type},
             operation_name="balance",
+            deadline_monotonic=deadline_monotonic,
         )
         address = data.get("address")
         if address is None:
@@ -282,16 +364,18 @@ class SuiGraphQLGateway:
             return 0
         return int(balance.get("totalBalance") or 0)
 
-    def list_owned_objects(
+    def iter_owned_objects(
         self,
         owner: str,
         type_filter: str | None = None,
         *,
         page_size: int = 50,
         max_pages: int = 1000,
-    ) -> list[dict[str, Any]]:
-        objects: list[dict[str, Any]] = []
+        max_items: int | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> Iterator[dict[str, Any]]:
         cursor: str | None = None
+        item_count = 0
         for _ in range(max_pages):
             data = self.execute(
                 self.OWNED_OBJECTS_QUERY,
@@ -302,35 +386,70 @@ class SuiGraphQLGateway:
                     "after": cursor,
                 },
                 operation_name="owned objects",
+                deadline_monotonic=deadline_monotonic,
             )
             connection = ((data.get("address") or {}).get("objects") or {})
-            objects.extend(self._move_object(node) for node in connection.get("nodes") or [])
+            nodes = connection.get("nodes") or []
+            if max_items is not None and item_count + len(nodes) > max_items:
+                raise SuiGatewayError("Owned-object pagination exceeded item safety limit")
+            for node in nodes:
+                item_count += 1
+                yield self._move_object(node)
             page_info = connection.get("pageInfo") or {}
             if not page_info.get("hasNextPage"):
-                return objects
+                return
             cursor = page_info.get("endCursor")
             if not cursor:
                 raise SuiGatewayError("Owned-object pagination omitted endCursor")
         raise SuiGatewayError("Owned-object pagination exceeded safety limit")
 
-    def get_object(self, address: str) -> dict[str, Any] | None:
+    def list_owned_objects(
+        self,
+        owner: str,
+        type_filter: str | None = None,
+        *,
+        page_size: int = 50,
+        max_pages: int = 1000,
+        max_items: int | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> list[dict[str, Any]]:
+        return list(
+            self.iter_owned_objects(
+                owner,
+                type_filter,
+                page_size=page_size,
+                max_pages=max_pages,
+                max_items=max_items,
+                deadline_monotonic=deadline_monotonic,
+            )
+        )
+
+    def get_object(
+        self,
+        address: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any] | None:
         data = self.execute(
             self.OBJECT_QUERY,
             {"address": address},
             operation_name="object",
+            deadline_monotonic=deadline_monotonic,
         )
         node = data.get("object")
         return self._move_object(node) if node else None
 
-    def list_dynamic_fields(
+    def iter_dynamic_fields(
         self,
         parent: str,
         *,
         page_size: int = 50,
         max_pages: int = 1000,
-    ) -> list[dict[str, Any]]:
-        fields: list[dict[str, Any]] = []
+        max_items: int | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> Iterator[dict[str, Any]]:
         cursor: str | None = None
+        item_count = 0
         for _ in range(max_pages):
             data = self.execute(
                 self.DYNAMIC_FIELDS_QUERY,
@@ -340,16 +459,41 @@ class SuiGraphQLGateway:
                     "after": cursor,
                 },
                 operation_name="dynamic fields",
+                deadline_monotonic=deadline_monotonic,
             )
             connection = ((data.get("object") or {}).get("dynamicFields") or {})
-            fields.extend(connection.get("nodes") or [])
+            nodes = connection.get("nodes") or []
+            if max_items is not None and item_count + len(nodes) > max_items:
+                raise SuiGatewayError("Dynamic-field pagination exceeded item safety limit")
+            for node in nodes:
+                item_count += 1
+                yield node
             page_info = connection.get("pageInfo") or {}
             if not page_info.get("hasNextPage"):
-                return fields
+                return
             cursor = page_info.get("endCursor")
             if not cursor:
                 raise SuiGatewayError("Dynamic-field pagination omitted endCursor")
         raise SuiGatewayError("Dynamic-field pagination exceeded safety limit")
+
+    def list_dynamic_fields(
+        self,
+        parent: str,
+        *,
+        page_size: int = 50,
+        max_pages: int = 1000,
+        max_items: int | None = None,
+        deadline_monotonic: float | None = None,
+    ) -> list[dict[str, Any]]:
+        return list(
+            self.iter_dynamic_fields(
+                parent,
+                page_size=page_size,
+                max_pages=max_pages,
+                max_items=max_items,
+                deadline_monotonic=deadline_monotonic,
+            )
+        )
 
     def verify_personal_message(
         self,
@@ -384,3 +528,25 @@ class SuiGraphQLGateway:
         if not isinstance(identifier, str) or not identifier:
             raise SuiGatewayError("Sui GraphQL returned an empty chain identifier")
         return identifier
+
+    @staticmethod
+    def _endpoint_label(endpoint: str) -> str:
+        parsed = urlsplit(endpoint)
+        host = parsed.hostname or "unknown-provider"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{host}{parsed.path or ''}"
+
+    def provider_status(self) -> list[dict[str, Any]]:
+        """Return credential-free circuit state for health/admin diagnostics."""
+        now = time.monotonic()
+        with self._state_lock:
+            return [
+                {
+                    "provider": self._endpoint_label(endpoint),
+                    "failures": state.failures,
+                    "circuit_open": state.open_until > now,
+                    "retry_after_seconds": round(max(0.0, state.open_until - now), 3),
+                }
+                for endpoint, state in self._states.items()
+            ]
