@@ -2,7 +2,6 @@ import telebot
 import os
 import html as html_module
 import hashlib
-import hmac
 import logging
 import json
 import sys
@@ -11,6 +10,8 @@ import threading
 import requests
 import re
 import random
+import secrets
+import math
 from flask import Flask, jsonify, request, render_template
 from telebot import types
 import psycopg2
@@ -18,15 +19,26 @@ from psycopg2 import pool
 from logging.handlers import RotatingFileHandler
 from contextlib import contextmanager
 from io import StringIO, BytesIO
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 import csv
 import functools
 import datetime
 import gc
 import psutil
 import stripe
+from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor
 from waitress import serve as waitress_serve
+from verification_security import (
+    build_wallet_ownership_message,
+    canonical_sui_address,
+)
+from runtime_support import DelayedTaskScheduler, SlidingWindowRateLimiter
+from sui_gateway import (
+    DEFAULT_SUI_GRAPHQL_URL,
+    SuiGatewayError,
+    SuiGraphQLGateway,
+)
 
 # ==================== Refactored Module Imports ====================
 # HTML templates are in templates/ directory (Jinja2).
@@ -36,7 +48,7 @@ CACHE_TTL = 1200      # Cache Time-To-Live in seconds (20 minutes)
 VERIFICATION_CACHE_TTL = 60  # Freshness target for interactive verification checks
 NFT_CACHE_TTL = 43200   # Cache Time-To-Live for NFTs in seconds (12 hours)
 API_TIMEOUT = 60        # Timeout for API calls in seconds
-SLEEP_BETWEEN_TASKS = 172800 # Interval (seconds) for periodic tasks (48 hours)
+SLEEP_BETWEEN_TASKS = int(os.getenv('WALLET_CHECK_INTERVAL_SECONDS', '172800'))
 BOT_POLLING_TIMEOUT = 30  # Bot polling timeout (seconds)
 BOT_LONG_POLLING_TIMEOUT = 10 # Bot long polling timeout (seconds)
 REMINDER_THRESHOLD = 1200   # Reminder threshold in seconds (20 minutes)
@@ -47,12 +59,23 @@ ALERT_COOLDOWN_DAYS = 2 # Days before re-alerting a user with low balance
 # low-holdings user gets one retry under the delivery-safe implementation.
 ALERT_DELIVERY_VERSION = 1
 MAX_CACHE_SIZE = 1000  # Maximum number of entries in balance/NFT caches
-NFT_RPC_RETRY_DELAY = 2  # Seconds to wait before retrying an NFT RPC check
+NFT_PROVIDER_RETRY_DELAY = 2  # Seconds to wait before retrying an NFT provider check
 DB_POOL_MIN = int(os.getenv('DB_POOL_MIN', '5'))  # Minimum database connections
 DB_POOL_MAX = int(os.getenv('DB_POOL_MAX', '15'))  # Maximum database connections
 TASK_JITTER_PERCENT = 0.1  # Add ±10% jitter to task intervals to prevent thundering herd
-WALLET_FETCH_DELAY = 0.05  # Seconds between per-wallet RPC calls to avoid burst traffic
-GROUP_CHECK_DELAY = 2     # Seconds between group checks to give the RPC endpoint breathing room
+GROUP_CHECK_DELAY = 2     # Seconds between group checks to give the provider breathing room
+SCHEDULER_LEASE_SECONDS = 300  # Recover quickly if a worker exits unexpectedly
+SCHEDULER_LEASE_RENEW_SECONDS = 60
+SCHEDULER_INSTANCE_ID = secrets.token_urlsafe(16)
+TELEGRAM_ALLOWED_UPDATES = [
+    'message',
+    'callback_query',
+    'chat_member',
+    'my_chat_member',
+    'poll',
+    'poll_answer',
+    'pre_checkout_query',
+]
 
 # ==================== Logging Setup ==============================
 file_handler = RotatingFileHandler("bot.log", maxBytes=5 * 1024 * 1024, backupCount=5)
@@ -66,17 +89,35 @@ logging.getLogger().setLevel(logging.INFO)
 
 # ==================== Bot and Flask Configuration =================
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-SUI_RPC_URL = os.getenv('SUI_RPC_URL', 'https://fullnode.mainnet.sui.io:443')
+SUI_GRAPHQL_URLS = [
+    value.strip()
+    for value in os.getenv(
+        'SUI_GRAPHQL_URLS',
+        os.getenv('SUI_GRAPHQL_URL', DEFAULT_SUI_GRAPHQL_URL),
+    ).split(',')
+    if value.strip()
+]
 WALLET_CONNECT_URL = os.getenv('WALLET_CONNECT_URL', '').strip()
+WALLET_CONNECT_ALLOWED_HOSTS = {
+    value.strip().lower()
+    for value in os.getenv(
+        'WALLET_CONNECT_ALLOWED_HOSTS',
+        'alphacity.tech,www.alphacity.tech',
+    ).split(',')
+    if value.strip()
+}
 PUBLIC_WEBAPP_BASE_URL = os.getenv('PUBLIC_WEBAPP_BASE_URL', '').strip()
 FALLBACK_VERIFY_URL = 'https://token-gate-bot-production.up.railway.app/verify'
-# Shared secret for authenticating webhook callbacks from the external verify website.
-# Set WEBHOOK_SECRET in environment variables.  The website must send this value in
-# the X-Webhook-Secret request header when posting to /api/verify.
-WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '').strip()
-# Allowed origin for CORS on /api/verify.  Defaults to '*' (any origin) which is safe
-# for this credential-free JSON API, but can be restricted to a specific domain.
-CORS_ALLOWED_ORIGIN = os.getenv('CORS_ALLOWED_ORIGIN', '*').strip() or '*'
+CORS_ALLOWED_ORIGINS = {
+    value.strip().rstrip('/')
+    for value in os.getenv(
+        'CORS_ALLOWED_ORIGINS',
+        'https://alphacity.tech,https://www.alphacity.tech',
+    ).split(',')
+    if value.strip()
+}
+TELEGRAM_WEBHOOK_URL = os.getenv('TELEGRAM_WEBHOOK_URL', '').strip()
+TELEGRAM_WEBHOOK_SECRET = os.getenv('TELEGRAM_WEBHOOK_SECRET', '').strip()
 
 # ==================== Stripe Configuration ========================
 STRIPE_SECRET_KEY = os.getenv('STRIPE_SECRET_KEY', '').strip()
@@ -107,7 +148,7 @@ SUBSCRIPTION_TIERS = {
 }
 
 BOT_NAME = "CityWatchBot"
-CODE_SYNC_REV = "onchain-rpc-walletconnect-2026-02-26c"
+CODE_SYNC_REV = "sui-graphql-verification-2026-08-03"
 ADMIN_MEMBER_STATUSES = frozenset({"creator", "administrator"})
 ACTIVE_GROUP_MEMBER_STATUSES = frozenset({"creator", "administrator", "member", "restricted"})
 INACTIVE_MEMBER_STATUS_MESSAGES = {
@@ -115,9 +156,17 @@ INACTIVE_MEMBER_STATUS_MESSAGES = {
     "kicked": "❌ That user was removed from this group."
 }
 
-# Maximum age (in seconds) for verify-page tokens used to authenticate
-# requests coming from the bot's own /verify page.
-_VERIFY_TOKEN_MAX_AGE = 7200  # 2 hours
+# Verification sessions are server-stored, random, and single-use.  This is
+# deliberately short: a wallet-signature request should be completed while
+# the user is actively looking at the verification page.
+VERIFICATION_SESSION_TIMEOUT = 600  # 10 minutes
+
+
+def require_canonical_sui_address(address):
+    normalized = canonical_sui_address(address)
+    if not normalized:
+        raise ValueError("Invalid Sui address")
+    return normalized
 
 
 def encode_group_id_for_deeplink(group_id):
@@ -145,87 +194,21 @@ def decode_group_id_from_deeplink(encoded):
     return int(encoded)
 
 
-def _generate_verify_token(group_id, user_id):
-    """Create an HMAC-signed token proving a request originates from the /verify page.
-
-    The token encodes group_id, user_id and a timestamp.  It is embedded in
-    the page at render time and sent back with the verification payload so
-    the server can confirm the request came from a genuine page load.
-    """
-    ts = str(int(time.time()))
-    msg = f"{group_id}:{user_id}:{ts}"
-    # BOT_TOKEN is required for the bot to start; this fallback is
-    # purely defensive and will never execute at runtime.
-    secret = (BOT_TOKEN or "").encode("utf-8")
-    sig = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
-    return f"{msg}:{sig}"
-
-
-def _validate_verify_token(token, group_id, user_id, max_age=None):
-    """Validate a signed verify-page token.
-
-    Returns ``True`` when the token is well-formed, the HMAC is correct,
-    the embedded group/user IDs match, and the token has not expired.
-    """
-    if max_age is None:
-        max_age = _VERIFY_TOKEN_MAX_AGE
-    try:
-        if not token:
-            return False
-        parts = token.rsplit(":", 1)
-        if len(parts) != 2:
-            return False
-        msg, sig = parts
-        # msg = "group_id:user_id:ts"
-        msg_parts = msg.split(":")
-        if len(msg_parts) != 3:
-            return False
-        tok_group, tok_user, tok_ts = msg_parts
-        if str(group_id) != tok_group or str(user_id) != tok_user:
-            return False
-        if time.time() - int(tok_ts) > max_age:
-            return False
-        secret = (BOT_TOKEN or "").encode("utf-8")
-        expected_sig = hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(sig, expected_sig)
-    except Exception:
-        return False
-
-
-def _apply_verify_token_fallback(requirement_eval, balance_verified, verify_token, group_id, user_id, context_label):
-    """Accept the client-side verification when the backend RPC fails and the
-    request carries a valid page-session token.
-
-    Returns the (possibly updated) *requirement_eval* dict.
-    """
-    if (
-        requirement_eval.get('rpc_failed')
-        and not requirement_eval['requirements_met']
-        and balance_verified
-        and _validate_verify_token(verify_token, group_id, user_id)
-    ):
-        logging.warning(
-            f"{context_label}: server-side RPC failed for user {user_id}, "
-            f"group {group_id} — accepting client-side verification (valid page token)"
-        )
-        # Clean up details to show that they passed via client-side check
-        old_details = requirement_eval.get('details', [])
-        new_details = []
-        for d in old_details:
-            if "⚠️ check failed" in d:
-                d = d.replace("⚠️ check failed", "✓ passed (verified client-side)")
-            elif "⚠️ Check failed" in d:
-                d = d.replace("⚠️ Check failed", "✓ passed (verified client-side)")
-            new_details.append(d)
-        return {"requirements_met": True, "details": new_details, "errors": []}
-    return requirement_eval
-
-
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not found in environment variables")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_REQUEST_BYTES', '32768'))
+sui_gateway = SuiGraphQLGateway(
+    SUI_GRAPHQL_URLS,
+    timeout_seconds=float(os.getenv('SUI_GRAPHQL_TIMEOUT_SECONDS', '20')),
+    max_retries=int(os.getenv('SUI_GRAPHQL_RETRIES', '2')),
+)
+verification_rate_limiter = SlidingWindowRateLimiter(
+    limit=int(os.getenv('VERIFY_RATE_LIMIT', '20')),
+    window_seconds=int(os.getenv('VERIFY_RATE_WINDOW_SECONDS', '60')),
+)
 
 # Lazily cached bot username – populated on first call to get_bot_username().
 _BOT_USERNAME = None
@@ -247,8 +230,14 @@ def get_bot_id():
         _BOT_ID = bot.get_me().id
     return _BOT_ID
 
-# Bounded thread pool for fire-and-forget cleanup tasks (e.g. delayed message deletion).
-_cleanup_executor = ThreadPoolExecutor(max_workers=4)
+# Immediate work uses a bounded pool; delayed work waits on one priority queue.
+_background_executor = ThreadPoolExecutor(
+    max_workers=int(os.getenv('BACKGROUND_WORKERS', '4'))
+)
+_sui_executor = ThreadPoolExecutor(
+    max_workers=int(os.getenv('SUI_FETCH_WORKERS', '8'))
+)
+_delayed_tasks = DelayedTaskScheduler()
 
 
 def get_telegram_user_display_name(user):
@@ -257,19 +246,6 @@ def get_telegram_user_display_name(user):
         part for part in [user.first_name, getattr(user, "last_name", None)] if part
     ).strip()
     return getattr(user, "username", None) or full_name or f"User{user.id}"
-
-# ==================== API Session Setup =======================
-sui_rpc_session = requests.Session()
-sui_rpc_session.headers.update({
-    'Content-Type': 'application/json',
-    'Connection': 'keep-alive',
-    'User-Agent': 'WalletAlertBot/2.0'
-})
-adapter = requests.adapters.HTTPAdapter(  # type: ignore[attr-defined]
-    pool_connections=10,
-    pool_maxsize=20
-)
-sui_rpc_session.mount('https://', adapter)
 
 # ==================== Database Setup =============================
 db_lock = threading.Lock()
@@ -388,7 +364,13 @@ def get_connection_pool():
                 connection_string = connection_string + f"{separator}options=endpoint%3D{endpoint_id}"
                 logging.info(f"Added Neon endpoint parameter: {endpoint_id}")
 
-        logging.info(f"Final connection string (masked): {connection_string.split('@')[0]}@[MASKED]")
+        # Never log a connection URL: its user-info section contains the
+        # database password.  Host metadata is sufficient for diagnostics.
+        parsed_connection = urlsplit(connection_string)
+        safe_target = parsed_connection.hostname or "unknown-host"
+        if parsed_connection.port:
+            safe_target = f"{safe_target}:{parsed_connection.port}"
+        logging.info(f"Database connection target: {parsed_connection.scheme}://{safe_target} (credentials redacted)")
 
         tries = 0
         max_tries = 5
@@ -489,7 +471,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS subscriber_configs (
                 chat_id BIGINT PRIMARY KEY,
                 token TEXT,
-                minimum_holding REAL,
+                minimum_holding NUMERIC(78, 18),
                 wallets TEXT,
                 decimals INTEGER DEFAULT 6,
                 auto_remove BOOLEAN DEFAULT FALSE,
@@ -526,7 +508,7 @@ def init_db():
                 poll_id TEXT,
                 user_id BIGINT,
                 option_index INTEGER,
-                vote_weight REAL,
+                vote_weight NUMERIC(78, 18),
                 PRIMARY KEY (poll_id, user_id)
             )
         """)
@@ -547,6 +529,38 @@ def init_db():
             )
         """)
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS verification_sessions (
+                session_id TEXT PRIMARY KEY,
+                group_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                consumed_at TIMESTAMP DEFAULT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                processing_at TIMESTAMP DEFAULT NULL,
+                completed_at TIMESTAMP DEFAULT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_wallet_addresses (
+                group_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                wallet_address TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (group_id, user_id, wallet_address),
+                UNIQUE (group_id, wallet_address),
+                FOREIGN KEY (group_id, user_id)
+                    REFERENCES user_wallets(group_id, user_id)
+                    ON DELETE CASCADE
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
                 group_id BIGINT PRIMARY KEY,
                 stripe_session_id TEXT,
@@ -562,11 +576,20 @@ def init_db():
                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS scheduler_leases (
+                lease_name TEXT PRIMARY KEY,
+                holder_id TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL
+            )
+        """)
         # Create indexes for frequently queried columns to optimize performance
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_wallets_user ON user_wallets(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_voting_polls_group ON voting_polls(group_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_voting_polls_active ON voting_polls(is_active) WHERE is_active = TRUE")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_verifications_created_at ON pending_verifications(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_verification_sessions_expiry ON verification_sessions(expires_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_addresses_user ON user_wallet_addresses(group_id, user_id)")
         try:
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS auto_remove BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_collection_id TEXT DEFAULT ''")
@@ -583,14 +606,87 @@ def init_db():
             cur.execute("ALTER TABLE subscriber_configs ADD COLUMN IF NOT EXISTS nft_trait_threshold INTEGER DEFAULT 1")
             cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_nft_count INTEGER DEFAULT NULL")
             cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_trait_count INTEGER DEFAULT NULL")
-            cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_token_balance REAL DEFAULT NULL")
+            cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS last_token_balance NUMERIC(78, 18) DEFAULT NULL")
             cur.execute("ALTER TABLE user_wallets ADD COLUMN IF NOT EXISTS holdings_updated_at TIMESTAMP DEFAULT NULL")
             cur.execute("ALTER TABLE low_balance_alerts ADD COLUMN IF NOT EXISTS delivery_version INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'")
+            cur.execute("ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS processing_at TIMESTAMP DEFAULT NULL")
+            cur.execute("ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP DEFAULT NULL")
+            cur.execute("""
+                UPDATE verification_sessions
+                SET status = 'completed',
+                    completed_at = COALESCE(completed_at, consumed_at)
+                WHERE consumed_at IS NOT NULL
+                  AND completed_at IS NULL
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_verification_sessions_status ON verification_sessions(status, expires_at)")
+
+            migration_version = "20260803_graphql_verification"
+            cur.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = %s",
+                (migration_version,),
+            )
+            if cur.fetchone() is None:
+                cur.execute("""
+                    ALTER TABLE subscriber_configs
+                    ALTER COLUMN minimum_holding TYPE NUMERIC(78, 18)
+                    USING minimum_holding::NUMERIC
+                """)
+                cur.execute("""
+                    ALTER TABLE poll_votes
+                    ALTER COLUMN vote_weight TYPE NUMERIC(78, 18)
+                    USING vote_weight::NUMERIC
+                """)
+                cur.execute("""
+                    ALTER TABLE user_wallets
+                    ALTER COLUMN last_token_balance TYPE NUMERIC(78, 18)
+                    USING last_token_balance::NUMERIC
+                """)
+                cur.execute(
+                    """
+                    SELECT group_id, user_id, wallets
+                    FROM user_wallets
+                    ORDER BY group_id, user_id
+                    """
+                )
+                for group_id, user_id, wallets_json in cur.fetchall():
+                    try:
+                        stored_wallets = json.loads(wallets_json) if wallets_json else []
+                    except (TypeError, ValueError):
+                        logging.warning(
+                            "Skipping malformed wallet JSON during normalized-address backfill "
+                            "for group=%s user=%s",
+                            group_id,
+                            user_id,
+                        )
+                        continue
+                    for stored_wallet in stored_wallets:
+                        try:
+                            normalized_wallet = require_canonical_sui_address(stored_wallet)
+                        except ValueError:
+                            logging.warning(
+                                "Skipping invalid wallet during normalized-address backfill "
+                                "for group=%s user=%s",
+                                group_id,
+                                user_id,
+                            )
+                            continue
+                        cur.execute(
+                            """
+                            INSERT INTO user_wallet_addresses
+                                (group_id, user_id, wallet_address)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (group_id, user_id, normalized_wallet),
+                        )
+                cur.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (%s)",
+                    (migration_version,),
+                )
         except Exception as e:
-            logging.error(f"Error adding new columns: {e}")
-            conn.rollback()
-            logging.warning("Database initialized with migration errors (non-critical columns may be missing)")
-            return True
+            logging.exception("Database migration failed; refusing to start with a partial schema")
+            raise
         logging.info("Database initialized successfully")
         return True
 
@@ -718,63 +814,131 @@ def get_registration_mode_display(mode):
     }
     return mode_display.get(mode, mode.title())
 
-@db_retry
-def save_wallet_for_user(group_id, user_id, username, wallet_list, is_exempt=None, replace_existing=False, registration_type="token"):
-    with get_db_cursor() as (conn, cur):
-        existing_wallets = []
-        existing_exempt = False
-        
-        # Always check for existing registration to preserve is_exempt if not explicitly provided
-        cur.execute("SELECT wallets, is_exempt FROM user_wallets WHERE group_id=%s AND user_id=%s", (group_id, user_id))
-        result = cur.fetchone()
-        if result:
+def _save_wallet_for_user_with_cursor(
+    cur,
+    group_id,
+    user_id,
+    username,
+    wallet_list,
+    *,
+    is_exempt=None,
+    replace_existing=False,
+    registration_type="token",
+):
+    """Save JSON compatibility data and normalized addresses in one transaction."""
+    normalized_incoming = [require_canonical_sui_address(wallet) for wallet in wallet_list]
+    existing_wallets = []
+    existing_exempt = False
+
+    cur.execute(
+        """
+        SELECT wallets, is_exempt
+        FROM user_wallets
+        WHERE group_id = %s AND user_id = %s
+        FOR UPDATE
+        """,
+        (group_id, user_id),
+    )
+    result = cur.fetchone()
+    if result:
+        try:
+            if result[0]:
+                existing_wallets = json.loads(result[0])
+            existing_exempt = bool(result[1])
+        except (TypeError, ValueError):
+            logging.warning(
+                "Ignoring malformed stored wallet list for group=%s user=%s",
+                group_id,
+                user_id,
+            )
+
+    if is_exempt is None:
+        is_exempt = existing_exempt
+    else:
+        is_exempt = bool(is_exempt or existing_exempt)
+
+    normalized_existing = []
+    if existing_wallets and not replace_existing:
+        for wallet in existing_wallets:
             try:
-                if result[0]:
-                    existing_wallets = json.loads(result[0])
-                    logging.info(f"Found existing wallets for user {username}: {len(existing_wallets)} wallets")
-                existing_exempt = bool(result[1])
-            except Exception as e:
-                logging.error(f"Error parsing existing wallets: {e}")
+                    normalized_existing.append(require_canonical_sui_address(wallet))
+            except ValueError:
+                logging.warning(
+                    "Ignoring invalid stored wallet for group=%s user=%s",
+                    group_id,
+                    user_id,
+                )
+    combined_wallets = list(
+        dict.fromkeys(
+            normalized_incoming
+            if replace_existing
+            else normalized_incoming + normalized_existing
+        )
+    )
+    wallets_json = json.dumps(combined_wallets)
+    cur.execute(
+        """
+        INSERT INTO user_wallets
+            (group_id, user_id, username, wallets, is_exempt, registration_type)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT(group_id, user_id) DO UPDATE SET
+            username = EXCLUDED.username,
+            wallets = EXCLUDED.wallets,
+            is_exempt = EXCLUDED.is_exempt,
+            registration_type = EXCLUDED.registration_type
+        """,
+        (
+            group_id,
+            user_id,
+            username,
+            wallets_json,
+            is_exempt,
+            registration_type,
+        ),
+    )
+    cur.execute(
+        "DELETE FROM user_wallet_addresses WHERE group_id = %s AND user_id = %s",
+        (group_id, user_id),
+    )
+    for wallet in combined_wallets:
+        cur.execute(
+            """
+            INSERT INTO user_wallet_addresses
+                (group_id, user_id, wallet_address)
+            VALUES (%s, %s, %s)
+            """,
+            (group_id, user_id, wallet),
+        )
+    logging.info(
+        "Saved %s wallet(s) for group=%s user=%s",
+        len(combined_wallets),
+        group_id,
+        user_id,
+    )
+    return True
 
-        # If is_exempt is not explicitly set, preserve the existing state
-        if is_exempt is None:
-            is_exempt = existing_exempt
-        else:
-            # If they were already exempt, preserve it unless explicitly overridden
-            is_exempt = is_exempt or existing_exempt
 
-        if existing_wallets and not replace_existing:
-            existing_lower = [w.lower() for w in existing_wallets]
-            combined_wallets = []
-            for wallet in wallet_list:
-                if wallet.lower() not in existing_lower:
-                    combined_wallets.append(wallet.lower())
-                    existing_lower.append(wallet.lower())
-            combined_wallets.extend([w.lower() for w in existing_wallets])
-            seen = set()
-            combined_wallets = [w for w in combined_wallets if not (w.lower() in seen or seen.add(w.lower()))]
-        else:
-            combined_wallets = [w.lower() for w in wallet_list]
-        wallets_json = json.dumps(combined_wallets)
-        total_wallets = len(combined_wallets)
-        logging.info(f"Saving wallets for user {username}: {total_wallets} wallets total, exempt: {is_exempt}")
-        cur.execute("""
-            INSERT INTO user_wallets (group_id, user_id, username, wallets, is_exempt, registration_type)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT(group_id, user_id) DO UPDATE SET
-                username=EXCLUDED.username,
-                wallets=EXCLUDED.wallets,
-                is_exempt=EXCLUDED.is_exempt,
-                registration_type=EXCLUDED.registration_type
-        """, (group_id, user_id, username, wallets_json, is_exempt, registration_type))
-        cur.execute("SELECT wallets, is_exempt FROM user_wallets WHERE group_id=%s AND user_id=%s", (group_id, user_id))
-        result = cur.fetchone()
-        if result:
-            logging.info(f"Verified wallets for user {username}: {result[0]}, exempt: {result[1]}")
-            return True
-        else:
-            logging.error(f"Failed to verify wallet save for user {username}")
-            return False
+@db_retry
+def save_wallet_for_user(
+    group_id,
+    user_id,
+    username,
+    wallet_list,
+    is_exempt=None,
+    replace_existing=False,
+    registration_type="token",
+):
+    with get_db_cursor() as (conn, cur):
+        return _save_wallet_for_user_with_cursor(
+            cur,
+            group_id,
+            user_id,
+            username,
+            wallet_list,
+            is_exempt=is_exempt,
+            replace_existing=replace_existing,
+            registration_type=registration_type,
+        )
 
 @db_retry
 def get_user_registration(group_id, user_id):
@@ -821,7 +985,7 @@ def get_user_registrations_for_group(group_id):
 @db_retry
 def update_user_cached_holdings(group_id, user_id, nft_count=None, trait_count=None, token_balance=None):
     """Persist last-known on-chain holdings so display functions can fall back
-    to them when live RPC lookups fail.
+    to them when live provider lookups fail.
 
     Parameters
     ----------
@@ -966,6 +1130,58 @@ def activate_subscription(group_id, stripe_session_id, tier, activated_by):
     logging.info(f"Subscription activated for group {group_id}: tier={tier}, expires={new_expiry}")
     return new_expiry
 
+
+@db_retry
+def activate_subscription_from_stripe(group_id, stripe_session_id, tier, activated_by):
+    """Atomically claim a Stripe checkout session and extend a subscription.
+
+    Stripe can deliver the same event concurrently.  The event claim and the
+    expiry calculation must therefore happen in one database transaction;
+    checking first and inserting later can grant the same purchase twice.
+    Returns ``(new_expiry, processed_now)``.
+    """
+    tier_info = SUBSCRIPTION_TIERS.get(tier)
+    if not tier_info:
+        raise ValueError(f"Unknown subscription tier: {tier}")
+    if not stripe_session_id:
+        raise ValueError("Stripe session ID is required")
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "INSERT INTO stripe_processed_events (session_id) VALUES (%s) ON CONFLICT DO NOTHING RETURNING session_id",
+            (stripe_session_id,),
+        )
+        if cur.fetchone() is None:
+            return None, False
+
+        # Lock the group row while computing its extension point, so two
+        # different valid purchases for one group cannot overwrite each other.
+        cur.execute("SELECT expires_at FROM subscriptions WHERE group_id = %s FOR UPDATE", (group_id,))
+        row = cur.fetchone()
+        existing_expiry = row[0] if row else None
+        if existing_expiry and existing_expiry.tzinfo is None:
+            existing_expiry = existing_expiry.replace(tzinfo=datetime.timezone.utc)
+        new_expiry = (
+            existing_expiry + datetime.timedelta(days=tier_info["days"])
+            if existing_expiry and existing_expiry > now
+            else now + datetime.timedelta(days=tier_info["days"])
+        )
+        cur.execute(
+            """
+            INSERT INTO subscriptions (group_id, stripe_session_id, tier, activated_at, expires_at, activated_by)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (group_id) DO UPDATE SET
+                stripe_session_id = EXCLUDED.stripe_session_id,
+                tier = EXCLUDED.tier,
+                activated_at = EXCLUDED.activated_at,
+                expires_at = EXCLUDED.expires_at,
+                activated_by = EXCLUDED.activated_by
+            """,
+            (group_id, stripe_session_id, tier, now, new_expiry, activated_by),
+        )
+    return new_expiry, True
+
 def create_stripe_checkout_session(group_id, user_id, tier):
     """Create a Stripe Checkout Session for a subscription purchase."""
     if not STRIPE_SECRET_KEY:
@@ -1010,21 +1226,20 @@ def wallet_already_registered(wallet_address, group_id, user_id=None):
 
     When *user_id* is ``None`` the behavior is unchanged (legacy callers).
     """
+    wallet_address = require_canonical_sui_address(wallet_address)
     with get_db_cursor() as (conn, cur):
-        cur.execute("SELECT user_id, wallets FROM user_wallets WHERE group_id=%s", (group_id,))
-        rows = cur.fetchall()
-    wallet_address = wallet_address.lower()
-    for (row_user_id, wallets_json) in rows:
-        try:
-            wallets = json.loads(wallets_json) if wallets_json else []
-        except Exception:
-            wallets = []
-        if wallet_address in [w.lower() for w in wallets]:
-            # Same user re-registering their own wallet → allow it
-            if user_id is not None and row_user_id == user_id:
-                return False
-            return True
-    return False
+        cur.execute(
+            """
+            SELECT user_id
+            FROM user_wallet_addresses
+            WHERE group_id = %s AND wallet_address = %s
+            """,
+            (group_id, wallet_address),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return False
+    return not (user_id is not None and row[0] == user_id)
 
 @db_retry
 def toggle_user_exemption(group_id, user_id, exempt_status):
@@ -1071,6 +1286,143 @@ balance_cache = {}
 nft_cache = {}
 last_registration_prompt = {}
 
+
+@db_retry
+def create_verification_session(group_id, user_id):
+    """Create an expiring verification session."""
+    session_id = secrets.token_urlsafe(32)
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            INSERT INTO verification_sessions (session_id, group_id, user_id, expires_at)
+            VALUES (%s, %s, %s, NOW() + (%s * INTERVAL '1 second'))
+            """,
+            (session_id, group_id, user_id, VERIFICATION_SESSION_TIMEOUT),
+        )
+    return session_id
+
+
+@db_retry
+def get_active_verification_session(session_id):
+    """Return an unfinished, unexpired verification session, if one exists."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            SELECT group_id, user_id
+            FROM verification_sessions
+            WHERE session_id = %s
+              AND status IN ('pending', 'processing')
+              AND completed_at IS NULL
+              AND consumed_at IS NULL
+              AND expires_at > NOW()
+            """,
+            (session_id,),
+        )
+        row = cur.fetchone()
+    if row:
+        return {"group_id": row[0], "user_id": row[1]}
+    return None
+
+
+@db_retry
+def claim_verification_session(session_id, group_id, user_id):
+    """Claim a pending session, recovering abandoned claims after two minutes."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            UPDATE verification_sessions
+            SET status = 'processing', processing_at = NOW()
+            WHERE session_id = %s
+              AND group_id = %s
+              AND user_id = %s
+              AND completed_at IS NULL
+              AND consumed_at IS NULL
+              AND expires_at > NOW()
+              AND (
+                    status = 'pending'
+                    OR (
+                        status = 'processing'
+                        AND processing_at < NOW() - INTERVAL '2 minutes'
+                    )
+              )
+            RETURNING session_id
+            """,
+            (session_id, group_id, user_id),
+        )
+        return cur.fetchone() is not None
+
+
+@db_retry
+def release_verification_session(session_id, group_id, user_id):
+    """Return a claimed session to pending after an indeterminate failure."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            UPDATE verification_sessions
+            SET status = 'pending', processing_at = NULL
+            WHERE session_id = %s
+              AND group_id = %s
+              AND user_id = %s
+              AND status = 'processing'
+              AND completed_at IS NULL
+              AND consumed_at IS NULL
+              AND expires_at > NOW()
+            """,
+            (session_id, group_id, user_id),
+        )
+        return cur.rowcount == 1
+
+
+@db_retry
+def finalize_verified_wallet(
+    session_id,
+    group_id,
+    user_id,
+    username,
+    wallet_address,
+    registration_type,
+):
+    """Atomically save a verified wallet and complete its claimed session."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            SELECT status
+            FROM verification_sessions
+            WHERE session_id = %s
+              AND group_id = %s
+              AND user_id = %s
+              AND completed_at IS NULL
+              AND consumed_at IS NULL
+              AND expires_at > NOW()
+            FOR UPDATE
+            """,
+            (session_id, group_id, user_id),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] != 'processing':
+            return False
+        _save_wallet_for_user_with_cursor(
+            cur,
+            group_id,
+            user_id,
+            username,
+            [wallet_address],
+            registration_type=registration_type,
+        )
+        cur.execute(
+            """
+            UPDATE verification_sessions
+            SET status = 'completed',
+                completed_at = NOW(),
+                consumed_at = NOW()
+            WHERE session_id = %s
+            """,
+            (session_id,),
+        )
+        return cur.rowcount == 1
+
 # ==================== Cleanup Functions =============================
 def cleanup_expired_data():
     """Clean up expired registrations, verifications, and prompts"""
@@ -1088,12 +1440,21 @@ def cleanup_expired_data():
     for key in expired_polls:
         del poll_creation_context[key]
 
-    # Clean up expired pending verifications from the database
+    # Clean up expired pending verification contexts and sessions from the database.
     try:
         with get_db_cursor() as (conn, cur):
-            cur.execute("DELETE FROM pending_verifications WHERE created_at < NOW() - INTERVAL '%s seconds'", (VERIFICATION_TIMEOUT,))
+            cur.execute(
+                """
+                DELETE FROM pending_verifications
+                WHERE created_at < NOW() - (%s * INTERVAL '1 second')
+                """,
+                (VERIFICATION_TIMEOUT,),
+            )
             if cur.rowcount > 0:
                 logging.info(f"Cleaned up {cur.rowcount} expired pending verifications from DB.")
+            cur.execute("DELETE FROM verification_sessions WHERE expires_at < NOW() - INTERVAL '1 day'")
+            if cur.rowcount > 0:
+                logging.info(f"Cleaned up {cur.rowcount} expired verification sessions from DB.")
     except Exception as e:
         logging.error(f"Error cleaning up expired verifications from DB: {e}")
 
@@ -1105,65 +1466,11 @@ CITY_STAKING_PACKAGE = "0x008856d5d6d60a088f6153dbe6f7697d19f81d1d0403695c9e9fba
 CITY_STAKING_TYPE = f"{CITY_STAKING_PACKAGE}::city_staking::UserStake<{CITY_TOKEN_TYPE}>"
 
 # ==================== fetch_wallet_balances Function =================
-def make_api_request_with_retry(request_callable, max_retries: int = 3, base_delay: int = 1):
-    """Run a request callable with exponential backoff retry logic."""
-    last_exception: Exception = Exception("No request attempted")
-    for attempt in range(max_retries):
-        try:
-            return request_callable()
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.RequestException) as e:
-            last_exception = e
-            if attempt == max_retries - 1:
-                logging.error(f"API request failed after {max_retries} attempts: {e}")
-                raise
-
-            # Honour Retry-After for HTTP 429 rate-limit responses.
-            response = getattr(e, 'response', None)
-            if response is not None and response.status_code == 429:
-                try:
-                    retry_after = int(response.headers.get('Retry-After', 30))
-                except (ValueError, TypeError):
-                    retry_after = 30
-                logging.warning(f"Rate limited (HTTP 429), retrying in {retry_after}s")
-                time.sleep(retry_after)
-            else:
-                delay = base_delay * (2 ** attempt)
-                logging.warning(f"API request failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {e}")
-                time.sleep(delay)
-    raise last_exception
-
-
-def sui_rpc_request(method: str, params, max_retries: int = 3):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": int(time.time() * 1000),
-        "method": method,
-        "params": params
-    }
-
-    def do_request():
-        response = sui_rpc_session.post(SUI_RPC_URL, json=payload, timeout=API_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        if 'error' in data:
-            err = data['error']
-            # If the RPC returned a 200 but the inner JSON payload indicates a rate limit
-            err_msg = str(err).lower()
-            if 'rate limit' in err_msg or 'too many requests' in err_msg or 'throttled' in err_msg:
-                # Set status code to 429 dynamically so retry decorator treats it as rate limited
-                response.status_code = 429
-            raise requests.exceptions.RequestException(f"Sui RPC error for {method}: {err}", response=response)
-        return data.get('result')
-
-    return make_api_request_with_retry(do_request, max_retries=max_retries)
-
-
 def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, cache_ttl=None):
-    """Fetch token balances directly from Sui RPC (on-chain), no third-party indexers.
-    
-    Caches balances on an individual wallet address level to prevent unnecessary RPC calls.
+    """Fetch exact token balances through Sui GraphQL.
+
+    Values are returned as ``Decimal`` human-readable units. ``None`` means the
+    provider result was indeterminate; it never means a zero balance.
     """
     results = {}
     current_time = time.time()
@@ -1183,89 +1490,62 @@ def fetch_wallet_balances(addresses, monitored_token, decimals, use_cache=True, 
                     continue
             missing_addresses.append(addr_lower)
 
-    # 2. Fetch missing balances from RPC
+    # 2. Fetch missing balances concurrently with a bounded worker pool.
     if missing_addresses:
-        for wallet in missing_addresses:
-            wallet_lower = wallet.lower()
+        scale = Decimal(10) ** int(decimals)
+
+        def fetch_one(wallet):
             try:
-                # Base balance check
-                result = sui_rpc_request("suix_getBalance", [wallet_lower, monitored_token])
-                raw_balance = result.get("totalBalance", "0") if result else "0"
-                amount = float(raw_balance) / (10 ** decimals)
-                
-                # If $CITY token, also fetch staked CITY balance
+                total_atomic = sui_gateway.get_balance_atomic(wallet, monitored_token)
                 if monitored_token == CITY_TOKEN_TYPE:
-                    staked = _fetch_staked_city_balance(wallet_lower, decimals)
-                    if staked is not None:
-                        amount += staked
-                    else:
-                        logging.warning(f"Could not fetch staked CITY for {wallet_lower}; using base balance only.")
-                
-                results[wallet_lower] = amount
+                    staked_atomic = _fetch_staked_city_balance_atomic(wallet)
+                    if staked_atomic is None:
+                        return wallet, None
+                    total_atomic += staked_atomic
+                return wallet, Decimal(total_atomic) / scale
+            except (SuiGatewayError, ValueError, TypeError) as exc:
+                logging.error("Failed to fetch on-chain balance for %s: %s", wallet, exc)
+                return wallet, None
 
-                # Cache the individual balance
-                if use_cache:
-                    with cache_lock:
-                        if len(balance_cache) >= MAX_CACHE_SIZE:
-                            sorted_keys = sorted(balance_cache.keys(), key=lambda k: balance_cache[k][0])
-                            for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
-                                del balance_cache[old_key]
-                        cache_key = f"{wallet_lower}|{monitored_token_lower}"
-                        balance_cache[cache_key] = (current_time, amount)
-
-            except Exception as e:
-                logging.error(f"Failed to fetch on-chain balance for {wallet_lower}: {e}")
-                results[wallet_lower] = None
-            
-            time.sleep(WALLET_FETCH_DELAY)
+        for wallet, amount in _sui_executor.map(fetch_one, missing_addresses):
+            results[wallet] = amount
+            if amount is not None and use_cache:
+                with cache_lock:
+                    if len(balance_cache) >= MAX_CACHE_SIZE:
+                        sorted_keys = sorted(
+                            balance_cache.keys(),
+                            key=lambda key: balance_cache[key][0],
+                        )
+                        for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
+                            del balance_cache[old_key]
+                    cache_key = f"{wallet}|{monitored_token_lower}"
+                    balance_cache[cache_key] = (current_time, amount)
 
     return results
 
 
-def _fetch_staked_city_balance(address: str, decimals: int) -> float | None:
-    """
-    Return the total staked $CITY balance for *address* by summing all
-    ``UserStake`` objects owned by that wallet.
-
-    Returns the human-readable float (i.e. divided by 10**decimals), or
-    ``None`` when the RPC call fails so the caller can decide whether to
-    treat the failure as non-fatal.
-    """
+def _fetch_staked_city_balance_atomic(address: str) -> int | None:
+    """Return atomic staked CITY units, or ``None`` for an unavailable result."""
     total_atomic = 0
-    cursor = None
     try:
-        while True:
-            params = [
-                address,
-                {
-                    "filter": {"StructType": CITY_STAKING_TYPE},
-                    "options": {"showContent": True},
-                },
-                cursor,
-                50,
-            ]
-            result = sui_rpc_request("suix_getOwnedObjects", params)
-            if not result:
-                break
-            for item in result.get("data", []):
-                fields = (
-                    ((item.get("data") or {}).get("content") or {}).get("fields") or {}
-                )
-                staked_amount = fields.get("staked_amount")
-                if staked_amount is None:
-                    # Older contract version stores it inside a Balance<CITY> struct.
-                    principal = fields.get("principal") or {}
-                    if isinstance(principal, dict):
-                        staked_amount = (principal.get("fields") or {}).get("value")
-                if staked_amount is not None:
-                    total_atomic += int(staked_amount)
-            if not result.get("hasNextPage"):
-                break
-            cursor = result.get("nextCursor")
-    except Exception as e:
-        logging.error(f"Failed to fetch staked CITY balance for {address}: {e}")
+        objects = sui_gateway.list_owned_objects(
+            address,
+            CITY_STAKING_TYPE,
+        )
+        for item in objects:
+            fields = (item.get("content") or {}).get("fields") or {}
+            staked_amount = fields.get("staked_amount")
+            if staked_amount is None:
+                principal = fields.get("principal") or {}
+                if isinstance(principal, dict):
+                    principal_fields = principal.get("fields") or principal
+                    staked_amount = principal_fields.get("value")
+            if staked_amount is not None:
+                total_atomic += int(staked_amount)
+        return total_atomic
+    except (SuiGatewayError, ValueError, TypeError) as exc:
+        logging.error("Failed to fetch staked CITY balance for %s: %s", address, exc)
         return None
-    return total_atomic / (10 ** decimals)
 
 
 # ==================== Periodic Tasks ==============================
@@ -1323,21 +1603,95 @@ def send_low_holdings_alerts_to_admins(group_id, alert_entries):
     return False
 
 
+@db_retry
+def refresh_wallet_scheduler_lease():
+    """Acquire or renew the cross-process periodic-check lease."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            INSERT INTO scheduler_leases (lease_name, holder_id, expires_at)
+            VALUES ('wallet_checks', %s, NOW() + (%s * INTERVAL '1 second'))
+            ON CONFLICT (lease_name) DO UPDATE SET
+                holder_id = EXCLUDED.holder_id,
+                expires_at = EXCLUDED.expires_at
+            WHERE scheduler_leases.expires_at < NOW()
+               OR scheduler_leases.holder_id = EXCLUDED.holder_id
+            RETURNING holder_id
+            """,
+            (SCHEDULER_INSTANCE_ID, SCHEDULER_LEASE_SECONDS),
+        )
+        return cur.fetchone() is not None
+
+
+@db_retry
+def refresh_telegram_poller_lease():
+    """Acquire or renew the single-active-instance Telegram polling lease."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            INSERT INTO scheduler_leases (lease_name, holder_id, expires_at)
+            VALUES ('telegram_poller', %s, NOW() + INTERVAL '2 minutes')
+            ON CONFLICT (lease_name) DO UPDATE SET
+                holder_id = EXCLUDED.holder_id,
+                expires_at = EXCLUDED.expires_at
+            WHERE scheduler_leases.expires_at < NOW()
+               OR scheduler_leases.holder_id = EXCLUDED.holder_id
+            RETURNING holder_id
+            """,
+            (SCHEDULER_INSTANCE_ID,),
+        )
+        return cur.fetchone() is not None
+
+
+def sleep_while_holding_wallet_scheduler_lease(seconds):
+    """Sleep in short intervals while renewing the scheduler lease."""
+    remaining = seconds
+    while remaining > 0:
+        time.sleep(min(SCHEDULER_LEASE_RENEW_SECONDS, remaining))
+        remaining -= SCHEDULER_LEASE_RENEW_SECONDS
+        if not refresh_wallet_scheduler_lease():
+            logging.warning("Lost periodic wallet-check lease while waiting; another worker may take over.")
+            return False
+    return True
+
+
 def check_user_wallets():
     """
     Efficiently checks all user wallets for a group in a single batch operation
     and implements a cooldown period for alerts to avoid spamming admins.
     """
+    retry_group_items = None
     while True:
+        group_items = []
+        group_index = -1
         try:
+            if not refresh_wallet_scheduler_lease():
+                logging.info("Another worker holds the periodic wallet-check lease; waiting before retrying.")
+                time.sleep(SCHEDULER_LEASE_RENEW_SECONDS)
+                continue
+
             with config_lock:
                 configs = dict(SUBSCRIBER_CONFIGS)
 
             logging.info(f"Starting periodic wallet check for {len(configs)} configured group(s).")
 
-            for group_id, config in configs.items():
+            # If a previous group raised unexpectedly, immediately continue
+            # with the later groups instead of delaying every one until the
+            # next scheduled (up to 48-hour) scan.
+            group_items = retry_group_items if retry_group_items is not None else list(configs.items())
+            retry_group_items = None
+            for group_index, (group_id, config) in enumerate(group_items):
+                if not refresh_wallet_scheduler_lease():
+                    logging.warning("Lost periodic wallet-check lease during scan; stopping this scan safely.")
+                    break
+                # Expired subscriptions disable every enforcement action.  Keep
+                # the saved configuration so an admin can renew without having
+                # to rebuild it, but do not scan, alert, or remove members.
+                if not group_has_active_subscription(group_id):
+                    logging.info(f"Skipping periodic gate enforcement for expired-subscription group {group_id}.")
+                    continue
                 token = config.get("token")
-                minimum_holding = config.get("minimum_holding", 5000000)
+                minimum_holding = Decimal(str(config.get("minimum_holding", 5000000)))
                 decimals = config.get("decimals", 6)
                 auto_remove = config.get("auto_remove", False)
                 nft_trait_name = config.get("nft_trait_name", "")
@@ -1411,7 +1765,7 @@ def check_user_wallets():
                     
                     # Check token holdings
                     token_valid = False
-                    total_balance = 0
+                    total_balance = Decimal(0)
                     if registration_mode in ["token", "both"] and token:
                         wallet_values = [all_balances.get(w) for w in user_wallets_lower]
                         if any(v is None for v in wallet_values):
@@ -1430,7 +1784,7 @@ def check_user_wallets():
                         try:
                             if nft_trait_name:
                                 # Fetch once with content so traits can be extracted from the
-                                # same result set, avoiding a second RPC round-trip.
+                                # same result set, avoiding a second provider round-trip.
                                 fetched_nfts = _fetch_owned_nfts(
                                     user_wallets_lower, nft_collection_id, show_content=True
                                 )
@@ -1446,7 +1800,7 @@ def check_user_wallets():
 
                             if user_nft_count is None:
                                 logging.warning(f"Skipping NFT check for user {user_id} in group {group_id} due to API failure.")
-                                nft_valid = True  # Safety: don't penalize on API failure
+                                nft_indeterminate = True
                             else:
                                 nft_valid = user_nft_count >= nft_threshold
                                 logging.info(
@@ -1454,14 +1808,14 @@ def check_user_wallets():
                                     f"{user_nft_count} / {nft_threshold} NFTs"
                                 )
                         except Exception as nft_e:
-                            logging.warning(f"NFT check API error for user {user_id}, allowing through: {nft_e}")
-                            nft_valid = True  # Safety: don't penalize on API failure
+                            logging.warning(f"NFT check API error for user {user_id}, deferring enforcement: {nft_e}")
+                            nft_indeterminate = True
                         
                         # Check trait requirements if configured and NFT collection check passed
                         if nft_valid and nft_trait_name:
                             try:
                                 if fetched_nfts is not None:
-                                    # Re-use already-fetched NFT objects; no second RPC call.
+                                    # Re-use already-fetched NFT objects; no second provider call.
                                     target_key = nft_trait_name.strip().lower()
                                     if nft_trait_value:
                                         target_val = nft_trait_value.strip().lower()
@@ -1484,15 +1838,19 @@ def check_user_wallets():
                                         user_trait_count = get_user_nft_category_count(
                                             user_wallets_lower, nft_collection_id, nft_trait_name
                                         )
-                                if user_trait_count is not None and user_trait_count < nft_trait_threshold:
+                                if user_trait_count is None:
+                                    trait_valid = False
+                                    trait_indeterminate = True
+                                elif user_trait_count < nft_trait_threshold:
                                     trait_valid = False
                                     logging.info(f"User {user_id} fails trait check: {user_trait_count} < {nft_trait_threshold}")
                             except Exception as trait_e:
-                                logging.warning(f"Trait check API error for user {user_id}, skipping trait enforcement: {trait_e}")
-                                trait_valid = True  # Safety: don't penalize on API failure
+                                logging.warning(f"Trait check API error for user {user_id}, deferring enforcement: {trait_e}")
+                                trait_valid = False
+                                trait_indeterminate = True
 
                         # Persist successful on-chain results so display
-                        # functions can fall back to them on RPC failure.
+                        # functions can fall back to them on provider failure.
                         if user_nft_count is not None or user_trait_count is not None:
                             try:
                                 update_user_cached_holdings(
@@ -1512,6 +1870,19 @@ def check_user_wallets():
                     elif registration_mode == "both":
                         # User meets requirements if EITHER token OR (NFT + trait) is satisfied
                         user_meets_requirements = token_valid or (nft_valid and trait_valid)
+
+                    if (
+                        not user_meets_requirements
+                        and registration_mode in ("nft", "both")
+                        and (nft_indeterminate or trait_indeterminate)
+                    ):
+                        logging.warning(
+                            "Deferring periodic enforcement for user %s in group %s "
+                            "because NFT holdings were indeterminate",
+                            user_id,
+                            group_id,
+                        )
+                        continue
                     
                     if not user_meets_requirements:
                         # LAZY MEMBERSHIP CHECK: verify if user is still in the group
@@ -1658,18 +2029,29 @@ def check_user_wallets():
                             "no administrator DM was delivered."
                         )
 
-                # Brief pause between groups to give the RPC endpoint breathing room.
+                # Brief pause between groups to give the provider breathing room.
                 time.sleep(GROUP_CHECK_DELAY)
 
             logging.info("Completed periodic wallet check for all configured groups.")
 
         except Exception as e:
-            logging.error(f"Error in user wallets check: {e}")
+            group_label = group_items[group_index][0] if 0 <= group_index < len(group_items) else "setup"
+            logging.exception(f"Error in periodic wallet check for group {group_label}: {e}")
+            if group_index >= 0:
+                retry_group_items = group_items[group_index + 1:] or None
+
+        if retry_group_items is not None:
+            logging.info(
+                f"Continuing periodic wallet scan with {len(retry_group_items)} unaffected group(s) "
+                "after a group-specific failure."
+            )
+            time.sleep(GROUP_CHECK_DELAY)
+            continue
         # Add jitter to prevent all groups checking at the same time
         jitter = SLEEP_BETWEEN_TASKS * TASK_JITTER_PERCENT * (2 * random.random() - 1)
         sleep_time = SLEEP_BETWEEN_TASKS + jitter
         logging.info(f"Next user wallets check in {sleep_time:.0f}s (base: {SLEEP_BETWEEN_TASKS}s, jitter: {jitter:+.0f}s)")
-        time.sleep(sleep_time)
+        sleep_while_holding_wallet_scheduler_lease(sleep_time)
 
 # ==================== Bot Handlers ================================
 def is_group_admin(message):
@@ -2729,7 +3111,7 @@ def display_wallet_holdings(group_id, send_to_chat_id=None):
         exempt = reg["is_exempt"]
 
         wallet_lines = []
-        total_balance = 0.0
+        total_balance = Decimal(0)
         balance_complete = True
         user_nft_count = None
         user_trait_count = None
@@ -2979,10 +3361,14 @@ def process_set_token_config(message, group_id):
 
     token, threshold_str, decimals_str = parts
     try:
-        threshold = float(threshold_str)
+        threshold = Decimal(threshold_str)
         decimals = int(decimals_str)
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Invalid threshold or decimals value. Please ensure they are numbers.")
+        if not threshold.is_finite() or threshold < 0:
+            raise ValueError("threshold must be a finite non-negative number")
+        if decimals < 0 or decimals > 18:
+            raise ValueError("decimals out of range")
+    except (ValueError, OverflowError):
+        bot.send_message(message.chat.id, "❌ Threshold must be a finite non-negative number and decimals must be between 0 and 18.")
         return
 
     # Validate SUI token type format: 0x<hex>::<module>::<Type>
@@ -3009,8 +3395,10 @@ def process_set_nft_collection(message, group_id):
 def process_set_nft_threshold(message, group_id):
     try:
         threshold = int(message.text.strip())
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Invalid NFT threshold value. Please enter a number.")
+        if threshold < 1:
+            raise ValueError("threshold must be positive")
+    except (ValueError, OverflowError):
+        bot.send_message(message.chat.id, "❌ Invalid NFT threshold. Please enter a positive integer.")
         return
     with config_lock:
         ensure_config_exists(group_id)
@@ -3087,7 +3475,7 @@ def process_set_votes_per_million(message, group_id):
 def process_set_vote_duration(message, group_id):
     try:
         hours = float(message.text.strip())
-        if hours <= 0:
+        if not math.isfinite(hours) or hours <= 0:
             raise ValueError("Duration must be positive")
         # Convert hours to seconds
         duration = int(hours * 3600)
@@ -3338,7 +3726,7 @@ def calculate_user_vote_weight(group_id, user_id):
         if nft_collection_id and votes_per_nft > 0:
             nft_count = get_user_nft_count(wallet_addresses, nft_collection_id)
             if nft_count is None:
-                logging.warning(f"NFT count RPC failed for user {user_id} in vote weight calc, using cached holdings")
+                logging.warning(f"NFT count provider failed for user {user_id} in vote weight calc, using cached holdings")
                 cached = get_user_cached_holdings(group_id, user_id)
                 nft_count = (cached or {}).get("nft_count", 0) or 0
             nft_votes = nft_count * votes_per_nft
@@ -3356,7 +3744,7 @@ def _normalize_collection_id(raw_id: str) -> str:
     Accepted inputs
     ---------------
     * Full SUI type string   ``0xPACKAGE::module::Struct``  → address portion
-      lowercased / zero-padded for canonical SUI RPC matching.
+      lowercased / zero-padded for canonical Sui matching.
     * SUI hex address         ``0xABCD…``                   → lowercased,
       zero-padded to 64 hex characters.
     """
@@ -3384,31 +3772,18 @@ def _normalize_collection_id(raw_id: str) -> str:
     return cid
 
 
-def _build_owned_objects_query(collection_id: str, *, show_content: bool = False):
-    """Build the ``SuiObjectResponseQuery`` dict for ``suix_getOwnedObjects``.
-
-    When *collection_id* is a recognisable type or package address the query
-    includes an RPC-level ``filter`` so only matching objects are returned.
-    """
-    options = {"showType": True}
-    if show_content:
-        options["showContent"] = True
-        options["showDisplay"] = True
-
-    query: dict = {"options": options}
-
+def _graphql_type_filter(collection_id: str) -> str | None:
+    """Return a GraphQL type/package prefix filter when the hint is canonical."""
     cid = (collection_id or "").strip()
-    if not cid:
-        return query
-
     if "::" in cid:
-        # Full type string → use StructType filter
-        query["filter"] = {"StructType": cid}
-    elif cid.startswith("0x") and len(cid) > 2 and all(c in "0123456789abcdefABCDEF" for c in cid[2:]):
-        # Hex package address → use Package filter
-        query["filter"] = {"Package": cid}
-
-    return query
+        return cid
+    if (
+        cid.startswith("0x")
+        and len(cid) > 2
+        and all(char in "0123456789abcdefABCDEF" for char in cid[2:])
+    ):
+        return cid
+    return None
 
 
 _KIOSK_OWNER_CAP_TYPE = (
@@ -3444,7 +3819,7 @@ def _extract_kiosk_id_from_personal_cap(obj: dict) -> str | None:
     if not isinstance(cap, dict):
         return None
 
-    cap_fields = cap.get("fields") or {}
+    cap_fields = cap.get("fields") or cap
 
     # Direct KioskOwnerCap (Mysten extension style)
     kiosk_id = cap_fields.get("for")
@@ -3461,201 +3836,86 @@ def _extract_kiosk_id_from_personal_cap(obj: dict) -> str | None:
             if kiosk_id:
                 return kiosk_id
 
-    # Fallback: try to find ``for`` anywhere in nested cap structure
-    # (handles any unexpected wrapping layers)
-    if isinstance(cap_fields, dict):
-        for _key, val in cap_fields.items():
-            if _key == "for" and isinstance(val, str):
-                return val
-            if isinstance(val, dict):
-                nested_for = (val.get("fields") or val).get("for")
-                if nested_for and isinstance(nested_for, str):
-                    return nested_for
+    # GraphQL returns Move JSON without the JSON-RPC ``fields`` wrappers.
+    def find_for(value):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key == "for" and isinstance(nested, str):
+                    return nested
+                result = find_for(nested)
+                if result:
+                    return result
+        elif isinstance(value, list):
+            for nested in value:
+                result = find_for(nested)
+                if result:
+                    return result
+        return None
 
-    return None
+    return find_for(cap_fields)
 
 
 def _fetch_personal_kiosk_ids(owner: str, max_retries: int = 2) -> list[str]:
-    """Discover Kiosk IDs from ``PersonalKioskCap`` objects owned by *owner*.
-
-    Since the ``PersonalKioskCap`` type lives in a non-framework package whose
-    address can vary, we cannot use a ``StructType`` filter.  Instead:
-
-    1. **Type-only scan** – paginate through all owned objects with
-       ``showType: True`` only (cheap) and collect object IDs whose type
-       ends with ``::personal_kiosk::PersonalKioskCap``.
-    2. **Content fetch** – for each matching object, call ``sui_getObject``
-       with ``showContent: True`` to extract the wrapped kiosk ID.
-
-    Returns a (possibly empty) list of Kiosk object IDs.
-    """
-    # Pass 1: lightweight type-only scan for PersonalKioskCap objects
-    personal_cap_ids = []
-    scan_query = {"options": {"showType": True}}
-    cursor = None
-    while True:
-        rpc_result = sui_rpc_request(
-            "suix_getOwnedObjects",
-            [owner, scan_query, cursor, 50],
-            max_retries=max_retries,
-        )
-        data = rpc_result.get("data", []) if rpc_result else []
-        for item in data:
-            obj = item.get("data", {})
-            obj_type = obj.get("type") or ""
-            if obj_type.endswith(_PERSONAL_KIOSK_CAP_SUFFIX):
-                oid = obj.get("objectId")
-                if oid:
-                    personal_cap_ids.append(oid)
-        if not rpc_result or not rpc_result.get("hasNextPage"):
-            break
-        cursor = rpc_result.get("nextCursor")
-
-    if not personal_cap_ids:
-        return []
-
-    # Pass 2: fetch content for each PersonalKioskCap to extract kiosk IDs
+    """Discover personal Kiosks in one paginated GraphQL owned-object scan."""
     kiosk_ids = []
-    for cap_id in personal_cap_ids:
-        try:
-            obj_resp = sui_rpc_request(
-                "sui_getObject",
-                [cap_id, {"showType": True, "showContent": True}],
-                max_retries=max_retries,
-            )
-            if obj_resp and obj_resp.get("data"):
-                kid = _extract_kiosk_id_from_personal_cap(obj_resp["data"])
-                if kid:
-                    kiosk_ids.append(kid)
-                else:
-                    logging.debug(
-                        f"PersonalKioskCap {cap_id} found but could not "
-                        f"extract kiosk ID from content"
-                    )
-        except Exception as e:
-            logging.warning(f"Error fetching PersonalKioskCap {cap_id}: {e}")
-
+    for obj in sui_gateway.list_owned_objects(owner):
+        if (obj.get("type") or "").endswith(_PERSONAL_KIOSK_CAP_SUFFIX):
+            kiosk_id = _extract_kiosk_id_from_personal_cap(obj)
+            if kiosk_id:
+                kiosk_ids.append(kiosk_id)
     return kiosk_ids
 
 
 def _fetch_kiosk_nfts(addresses, collection_id, show_content=False, max_retries=2):
-    """Fetch NFTs held inside SUI Kiosks owned by *addresses*.
-
-    Many SUI NFT collections use the Kiosk standard (``0x2::kiosk``).  NFTs
-    placed inside a Kiosk are **not** directly owned by the user's address, so
-    ``suix_getOwnedObjects`` with a ``StructType`` filter will not find them.
-
-    This helper discovers the user's Kiosks via their ``KioskOwnerCap`` objects
-    **and** ``PersonalKioskCap`` objects (used by collections like PrimeMachin
-    and EMP that require personal kiosks for transfer-policy enforcement),
-    then enumerates each Kiosk's dynamic fields to count items matching
-    *collection_id*.
-    """
+    """Fetch collection items held in standard and personal Sui Kiosks."""
     normalized = _normalize_collection_id(collection_id)
     if not normalized:
         return []
 
     hint_lower = normalized.lower()
 
-    cap_query = {
-        "filter": {"StructType": _KIOSK_OWNER_CAP_TYPE},
-        "options": {"showType": True, "showContent": True},
-    }
-
     results = []
     for owner in [a.lower() for a in addresses if a]:
-        # Step 1a: find all standard KioskOwnerCap objects → extract Kiosk IDs
         kiosk_ids = []
         seen_kiosk_ids = set()
-        cursor = None
-        while True:
-            rpc_result = sui_rpc_request(
-                "suix_getOwnedObjects",
-                [owner, cap_query, cursor, 50],
-                max_retries=max_retries,
-            )
-            data = rpc_result.get("data", []) if rpc_result else []
-            for item in data:
-                obj = item.get("data", {})
-                content = obj.get("content") or {}
-                fields = content.get("fields") or {}
-                kiosk_id = fields.get("for")
-                if kiosk_id and kiosk_id not in seen_kiosk_ids:
-                    seen_kiosk_ids.add(kiosk_id)
-                    kiosk_ids.append(kiosk_id)
-            if not rpc_result or not rpc_result.get("hasNextPage"):
-                break
-            cursor = rpc_result.get("nextCursor")
+        for obj in sui_gateway.list_owned_objects(owner, _KIOSK_OWNER_CAP_TYPE):
+            fields = (obj.get("content") or {}).get("fields") or {}
+            kiosk_id = fields.get("for")
+            if kiosk_id and kiosk_id not in seen_kiosk_ids:
+                seen_kiosk_ids.add(kiosk_id)
+                kiosk_ids.append(kiosk_id)
 
-        # Step 1b: find kiosks via PersonalKioskCap (used by collections
-        # that enforce personal-kiosk transfer policies, e.g. PrimeMachin).
-        try:
-            personal_kiosk_ids = _fetch_personal_kiosk_ids(
-                owner, max_retries=max_retries,
-            )
-            for kid in personal_kiosk_ids:
-                if kid not in seen_kiosk_ids:
-                    seen_kiosk_ids.add(kid)
-                    kiosk_ids.append(kid)
-            if personal_kiosk_ids:
-                logging.debug(
-                    f"Found {len(personal_kiosk_ids)} personal kiosk(s) "
-                    f"for {owner}"
-                )
-        except Exception as e:
-            logging.warning(
-                f"PersonalKioskCap scan failed for {owner}: {e}"
-            )
+        for kiosk_id in _fetch_personal_kiosk_ids(owner, max_retries=max_retries):
+            if kiosk_id not in seen_kiosk_ids:
+                seen_kiosk_ids.add(kiosk_id)
+                kiosk_ids.append(kiosk_id)
 
-        # Step 2: enumerate each Kiosk's dynamic fields for matching NFTs
         for kiosk_id in kiosk_ids:
-            try:
-                df_cursor = None
-                while True:
-                    df_result = sui_rpc_request(
-                        "suix_getDynamicFields",
-                        [kiosk_id, df_cursor, 50],
-                        max_retries=max_retries,
-                    )
-                    df_data = df_result.get("data", []) if df_result else []
-                    for field in df_data:
-                        # Only consider Kiosk Item entries (skip Listing, etc.)
-                        name_info = field.get("name") or {}
-                        name_type = (name_info.get("type") or "").lower()
-                        if "kiosk::item" not in name_type:
-                            continue
-                        obj_type = (field.get("objectType") or "").lower()
-                        if not obj_type:
-                            continue
-                        # Match against collection hint
-                        if hint_lower in obj_type:
-                            nft_entry = {
-                                "objectId": field.get("objectId", ""),
-                                "type": field.get("objectType", ""),
-                            }
-                            if show_content:
-                                # Fetch full object data when content is needed
-                                # (e.g. trait extraction)
-                                item_id = (name_info.get("value") or {}).get("id", "")
-                                if item_id:
-                                    obj_resp = sui_rpc_request(
-                                        "sui_getObject",
-                                        [item_id, {
-                                            "showType": True,
-                                            "showContent": True,
-                                            "showDisplay": True,
-                                        }],
-                                        max_retries=max_retries,
-                                    )
-                                    if obj_resp and obj_resp.get("data"):
-                                        nft_entry = obj_resp["data"]
-                            results.append(nft_entry)
-                    if not df_result or not df_result.get("hasNextPage"):
-                        break
-                    df_cursor = df_result.get("nextCursor")
-            except Exception as e:
-                logging.warning(f"Error enumerating kiosk {kiosk_id} for collection {collection_id}: {e}")
-                # Continue with remaining kiosks instead of aborting entirely
+            for field in sui_gateway.list_dynamic_fields(kiosk_id):
+                name_info = field.get("name") or {}
+                name_type = ((name_info.get("type") or {}).get("repr") or "").lower()
+                if "kiosk::item" not in name_type:
+                    continue
+                value = field.get("value") or {}
+                contents = value.get("contents") or {}
+                type_info = contents.get("type") or value.get("type") or {}
+                object_type = (type_info.get("repr") or "").lower()
+                if not object_type or hint_lower not in object_type:
+                    continue
+                nft_entry = {
+                    "objectId": value.get("address") or "",
+                    "type": type_info.get("repr") or "",
+                    "content": {
+                        "dataType": "moveObject",
+                        "type": type_info.get("repr") or "",
+                        "fields": contents.get("json") or value.get("json") or {},
+                    },
+                }
+                if not nft_entry["objectId"]:
+                    name_json = name_info.get("json") or {}
+                    if isinstance(name_json, dict):
+                        nft_entry["objectId"] = name_json.get("id") or ""
+                results.append(nft_entry)
 
     return results
 
@@ -3669,10 +3929,9 @@ def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=
     Checks both directly-owned objects **and** items held inside SUI Kiosks.
     """
     normalized = _normalize_collection_id(collection_id)
-    query = _build_owned_objects_query(normalized, show_content=show_content)
-    has_filter = "filter" in query
+    type_filter = _graphql_type_filter(normalized)
 
-    # Fallback client-side matching when no RPC filter is available
+    # Fallback client-side matching when no GraphQL type filter is available
     hint_lower = normalized.lower() if normalized else ""
 
     def matches(obj):
@@ -3695,35 +3954,13 @@ def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=
     results = []
     seen_ids = set()
     for owner in [a.lower() for a in addresses if a]:
-        cursor = None
-        while True:
-            rpc_result = sui_rpc_request(
-                "suix_getOwnedObjects",
-                # The public Sui RPC currently enforces a maximum page size
-                # of 50.  A larger request fails with -32602 and used to make
-                # periodic NFT checks fail open (therefore suppressing alerts).
-                [owner, query, cursor, 50],
-                max_retries=max_retries,
-            )
-            data = rpc_result.get("data", []) if rpc_result else []
-            for item in data:
-                obj = item.get("data", {})
-                oid = obj.get("objectId", "")
-                if oid in seen_ids:
-                    continue
-                if has_filter:
-                    # RPC already filtered; just skip coins/non-Move objects
-                    otype = (obj.get("type") or "").lower()
-                    if otype and "::" in otype and "coin::" not in otype:
-                        seen_ids.add(oid)
-                        results.append(obj)
-                else:
-                    if matches(obj):
-                        seen_ids.add(oid)
-                        results.append(obj)
-            if not rpc_result or not rpc_result.get("hasNextPage"):
-                break
-            cursor = rpc_result.get("nextCursor")
+        for obj in sui_gateway.list_owned_objects(owner, type_filter):
+            oid = obj.get("objectId", "")
+            if oid in seen_ids:
+                continue
+            if matches(obj):
+                seen_ids.add(oid)
+                results.append(obj)
 
     # Also check NFTs held inside SUI Kiosks
     try:
@@ -3738,11 +3975,8 @@ def _fetch_owned_nfts(addresses, collection_id, show_content=False, max_retries=
                 results.append(obj)
     except Exception as e:
         logging.error(f"Error fetching kiosk NFTs for collection {collection_id}: {e}")
-        # If no directly-owned NFTs were found, the kiosk failure is
-        # significant — all user NFTs may be inside kiosks.  Re-raise so
-        # callers know the count is unreliable.
-        if not results:
-            raise
+        # Any Kiosk failure makes the aggregate count incomplete.
+        raise
 
     return results
 
@@ -3751,7 +3985,7 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None,
     """Count NFTs for addresses via on-chain Sui owned-object queries.
 
     Returns the integer count on success or ``None`` when the on-chain
-    lookup fails (so callers can distinguish "0 NFTs" from "RPC error").
+    lookup fails (so callers can distinguish "0 NFTs" from a provider error).
     """
     current_time = time.time()
     normalized_addresses = [addr.lower() for addr in addresses if addr]
@@ -3787,9 +4021,7 @@ def get_user_nft_count(addresses, collection_id, use_cache=True, cache_ttl=None,
 def check_nft_ownership(addresses, collection_id, threshold):
     total_nft_count = get_user_nft_count(addresses, collection_id)
     if total_nft_count is None:
-        # RPC failure — default to True to avoid false-negative rejections
-        # during outages (consistent with other safety checks in the codebase).
-        return True
+        return None
     return total_nft_count >= threshold
 
 
@@ -3816,13 +4048,14 @@ def _extract_traits(obj: dict) -> dict:
     # Strategy 1: VecMap / list-of-key-value in ``attributes``
     attrs = fields.get("attributes") or {}
     if isinstance(attrs, dict):
-        # Could be VecMap with .fields.contents
-        inner_fields = attrs.get("fields") or {}
+        # GraphQL Move JSON omits the JSON-RPC ``fields`` wrappers, while
+        # older cached values may still contain them. Support both shapes.
+        inner_fields = attrs.get("fields") or attrs
         contents = inner_fields.get("contents") or []
         if not contents:
             # OriginByte style: attributes -> fields -> map -> fields -> contents
             map_field = inner_fields.get("map") or {}
-            map_inner = map_field.get("fields") or {}
+            map_inner = map_field.get("fields") or map_field
             contents = map_inner.get("contents") or []
         for entry in contents:
             ef = (entry.get("fields") or entry) if isinstance(entry, dict) else {}
@@ -3833,6 +4066,21 @@ def _extract_traits(obj: dict) -> dict:
                 val = (val.get("fields") or {}).get("value", "") or val.get("value", "")
             if isinstance(key, str) and isinstance(val, str) and key:
                 traits[key.lower()] = val.lower()
+        # Some collections expose attributes as a direct JSON object.
+        if not contents:
+            for key, value in attrs.items():
+                if key in ("fields", "contents", "map"):
+                    continue
+                if isinstance(key, str) and isinstance(value, str):
+                    traits[key.lower()] = value.lower()
+    elif isinstance(attrs, list):
+        for entry in attrs:
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("key")
+            value = entry.get("value")
+            if isinstance(key, str) and isinstance(value, str):
+                traits[key.lower()] = value.lower()
 
     # Strategy 2: flat struct fields that are plain strings
     for k, v in fields.items():
@@ -3937,12 +4185,15 @@ def get_user_nft_category_count(wallet_addresses, collection_id, trait_name, use
 
 
 def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=False):
-    """Evaluate configured token/NFT requirements for a wallet and return structured status."""
+    """Evaluate requirements as PASS, FAIL, or INDETERMINATE."""
     wallet_lower = wallet_address.lower()
     registration_mode = cfg.get("registration_mode", "token")
     token = cfg.get("token", "")
     decimals = cfg.get("decimals", 6)
-    minimum_holding = cfg.get("minimum_holding", 0)
+    try:
+        minimum_holding = Decimal(str(cfg.get("minimum_holding", 0)))
+    except (InvalidOperation, TypeError, ValueError):
+        minimum_holding = Decimal(0)
     nft_collection_id = cfg.get("nft_collection_id", "")
     nft_threshold = cfg.get("nft_threshold", 1)
     nft_trait_name = cfg.get("nft_trait_name", "")
@@ -3955,18 +4206,20 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
     token_valid = False
     nft_valid = False
     trait_valid = True
-    rpc_failed = False
+    token_indeterminate = False
+    nft_indeterminate = False
+    trait_indeterminate = False
 
     token_balance = None
     # When force_fresh is True (interactive verification), bypass the in-memory
-    # cache entirely so the RPC is always called with live data.  Otherwise use
+    # cache entirely so GraphQL is always queried with live data. Otherwise use
     # the normal cache with default TTL.
     use_cache_flag = not force_fresh
     if registration_mode in ["token", "both"] and token:
         balances = fetch_wallet_balances([wallet_lower], token, decimals, use_cache=use_cache_flag)
         token_balance = balances.get(wallet_lower)
         if token_balance is None:
-            rpc_failed = True
+            token_indeterminate = True
             errors.append("⚠️ Unable to verify token balance right now. Please retry in a moment.")
         else:
             token_valid = token_balance >= minimum_holding
@@ -3981,15 +4234,15 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
         # actively waiting and false negatives are costly.
         rpc_retries = 4 if force_fresh else 2
         nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=use_cache_flag, max_retries=rpc_retries)
-        # Retry once on RPC failure during interactive verification –
+        # Retry once on provider failure during interactive verification –
         # transient errors (rate limits, kiosk fetch timeouts) can cause
         # false negatives when the user's NFTs are inside SUI Kiosks.
         if nft_count is None and force_fresh:
-            time.sleep(NFT_RPC_RETRY_DELAY)
-            logging.info(f"Retrying NFT count for wallet {wallet_lower} after initial RPC failure")
+            time.sleep(NFT_PROVIDER_RETRY_DELAY)
+            logging.info(f"Retrying NFT count for wallet {wallet_lower} after initial provider failure")
             nft_count = get_user_nft_count([wallet_lower], nft_collection_id, use_cache=False, max_retries=rpc_retries)
         if nft_count is None:
-            rpc_failed = True
+            nft_indeterminate = True
             errors.append("⚠️ Unable to verify NFT ownership right now. Please retry in a moment.")
             details.append(f"*NFTs in Collection:* ⚠️ check failed (threshold: {nft_threshold})")
         else:
@@ -4007,23 +4260,41 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
 
                 if trait_count is None:
                     trait_api_failed = True
-                    details.append(f"*Trait Verification:* ⚠️ Unavailable for `{trait_desc}` (allowed through)")
+                    trait_valid = False
+                    trait_indeterminate = True
+                    errors.append("⚠️ Unable to verify NFT traits right now. Please retry in a moment.")
+                    details.append(f"*Trait Verification:* ⚠️ Unavailable for `{trait_desc}`")
                 else:
                     trait_valid = trait_count >= nft_trait_threshold
                     details.append(f"*Trait Verification:* {trait_count} {'✓' if trait_valid else '✗'} for `{trait_desc}` (threshold: {nft_trait_threshold})")
             except Exception as trait_e:
                 trait_api_failed = True
-                details.append("*Trait Verification:* ⚠️ Check failed (allowed through)")
-                logging.warning(f"Trait check failed for user {user_id}, allowing through: {trait_e}")
+                trait_valid = False
+                trait_indeterminate = True
+                errors.append("⚠️ Unable to verify NFT traits right now. Please retry in a moment.")
+                details.append("*Trait Verification:* ⚠️ Check failed")
+                logging.warning(f"Trait check failed for user {user_id}: {trait_e}")
 
+    nft_branch_valid = nft_valid and trait_valid
     if registration_mode == "token":
-        requirements_met = token_valid
+        status = "indeterminate" if token_indeterminate else ("pass" if token_valid else "fail")
     elif registration_mode == "nft":
-        requirements_met = nft_valid and trait_valid
+        status = (
+            "indeterminate"
+            if nft_indeterminate or trait_indeterminate
+            else ("pass" if nft_branch_valid else "fail")
+        )
     elif registration_mode == "both":
-        requirements_met = token_valid or (nft_valid and trait_valid)
+        if token_valid or nft_branch_valid:
+            status = "pass"
+        elif token_indeterminate or nft_indeterminate or trait_indeterminate:
+            status = "indeterminate"
+        else:
+            status = "fail"
     else:
-        requirements_met = False
+        status = "fail"
+
+    requirements_met = status == "pass"
 
     if not requirements_met and not errors:
         if registration_mode in ["token", "both"] and token and token_balance is not None and token_balance < minimum_holding:
@@ -4035,9 +4306,10 @@ def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=
 
     return {
         "requirements_met": requirements_met,
+        "status": status,
         "details": details,
         "errors": errors,
-        "rpc_failed": rpc_failed,
+        "rpc_failed": status == "indeterminate",
         "nft_count": nft_count,
         "trait_count": trait_count,
         "token_balance": token_balance,
@@ -4408,7 +4680,16 @@ def handle_chat_member_update(update):
             minimum_holding = config.get("minimum_holding", 0)
             nft_collection_id = config.get("nft_collection_id", "")
             nft_threshold = config.get("nft_threshold", 1)
+            nft_trait_name = config.get("nft_trait_name", "")
+            nft_trait_value = config.get("nft_trait_value", "")
+            nft_trait_threshold = config.get("nft_trait_threshold", 1)
             registration_mode = config.get("registration_mode", "token")
+
+            # A lapsed subscription disables the gate; do not prompt or
+            # evaluate existing registrations until it is renewed.
+            if not group_has_active_subscription(group_id):
+                logging.info(f"Skipping join-time gate enforcement for expired-subscription group {group_id}.")
+                return
 
             # If user has wallets, validate they meet current requirements
             if user_reg and user_reg["wallets"]:
@@ -4418,28 +4699,98 @@ def handle_chat_member_update(update):
 
                     token_valid = False
                     nft_valid = False
-                    trait_valid = True  # Defaults to True; trait enforcement only in evaluate_wallet_requirements
+                    trait_valid = True
+                    nft_indeterminate = False
+                    trait_indeterminate = False
+                    token_indeterminate = False
+                    nft_indeterminate = False
+                    trait_indeterminate = False
                     if registration_mode in ["token", "both"] and token:
                         balances = fetch_wallet_balances(wallet_addresses, token, decimals)
-                        total_balance = sum(balances.get(addr, 0) or 0 for addr in wallet_addresses)
-                        token_valid = total_balance >= minimum_holding
+                        known_balances = [
+                            balances.get(addr)
+                            for addr in wallet_addresses
+                            if balances.get(addr) is not None
+                        ]
+                        total_balance = sum(known_balances, Decimal(0))
+                        token_valid = total_balance >= Decimal(str(minimum_holding))
+                        token_indeterminate = (
+                            not token_valid
+                            and len(known_balances) != len(wallet_addresses)
+                        )
 
                     # Check NFT requirements if applicable
                     if registration_mode in ["nft", "both"] and nft_collection_id:
                         nft_valid = check_nft_ownership(wallet_addresses, nft_collection_id, nft_threshold)
+                        if nft_valid is None:
+                            nft_indeterminate = True
+                            nft_valid = False
+                        if nft_valid and nft_trait_name:
+                            try:
+                                if nft_trait_value:
+                                    trait_count = get_user_nft_trait_count(
+                                        wallet_addresses, nft_collection_id,
+                                        nft_trait_name, nft_trait_value,
+                                        use_cache=False,
+                                    )
+                                else:
+                                    trait_count = get_user_nft_category_count(
+                                        wallet_addresses, nft_collection_id,
+                                        nft_trait_name,
+                                        use_cache=False,
+                                    )
+                                # Fail open only when the chain query was
+                                # unavailable.  A real below-threshold count
+                                # must prompt the returning member to verify.
+                                if trait_count is not None:
+                                    trait_valid = trait_count >= nft_trait_threshold
+                                    if not trait_valid:
+                                        logging.info(
+                                            f"Returning user {user_id} fails trait gate in group {group_id}: "
+                                            f"{trait_count} / {nft_trait_threshold}"
+                                        )
+                                else:
+                                    trait_valid = False
+                                    trait_indeterminate = True
+                            except Exception as trait_e:
+                                trait_valid = False
+                                trait_indeterminate = True
+                                logging.warning(
+                                    f"Could not evaluate trait gate for returning user {user_id}: {trait_e}"
+                                )
 
-                    # Determine if requirements are met
-                    requirements_met = False
+                    nft_branch_valid = nft_valid and trait_valid
+                    requirements_indeterminate = False
                     if registration_mode == "token":
                         requirements_met = token_valid
+                        requirements_indeterminate = token_indeterminate
                     elif registration_mode == "nft":
-                        requirements_met = nft_valid and trait_valid
+                        requirements_met = nft_branch_valid
+                        requirements_indeterminate = nft_indeterminate or trait_indeterminate
                     elif registration_mode == "both":
-                        requirements_met = token_valid or (nft_valid and trait_valid)
+                        requirements_met = token_valid or nft_branch_valid
+                        requirements_indeterminate = (
+                            not requirements_met
+                            and (
+                                token_indeterminate
+                                or nft_indeterminate
+                                or trait_indeterminate
+                            )
+                        )
+                    else:
+                        requirements_met = False
 
                     # If requirements are met, user is valid - no prompt needed
                     if requirements_met:
                         logging.info(f"User {user_id} already meets registration requirements")
+                        return
+                    if requirements_indeterminate:
+                        logging.warning(
+                            "Deferring returning-member gate decision for user %s in group %s "
+                            "because Sui holdings were indeterminate",
+                            user_id,
+                            group_id,
+                        )
                         return
 
                 except Exception as e:
@@ -4490,13 +4841,12 @@ def handle_chat_member_update(update):
 
                 # Auto-delete registration prompt after 15 minutes
                 def delete_welcome(gid=group_id, mid=sent_message.message_id):
-                    time.sleep(900)  # 15 minutes
                     try:
                         bot.delete_message(gid, mid)
                     except Exception as e:
                         logging.debug(f"Could not auto-delete welcome message in group {gid}: {e}")
 
-                _cleanup_executor.submit(delete_welcome)
+                _delayed_tasks.schedule(900, delete_welcome)
 
             except Exception as e:
                 logging.error(f"Error sending registration reminder to new member: {e}")
@@ -4610,73 +4960,37 @@ def handle_start(message):
         bot.reply_to(message, "👋 Welcome to CityWatch! Use /help to see available commands.")
 
 def build_wallet_connect_url(group_id, user_id, cfg=None):
-    """Build a verification URL pointing to the static verify page on alphacity.tech
-    or a custom configured base URL.
-
-    When *cfg* is provided the group's token/NFT requirements are appended as
-    query parameters so the verify page knows what to check:
-      - token_type        : fully-qualified token type string (e.g. 0x...::city::CITY)
-      - required_balance  : minimum holding expressed in the token's smallest unit
-      - decimals          : token decimal places (for display formatting)
-      - minimum_holding   : human-readable minimum (e.g. 5000)
-      - registration_mode : "token", "nft", or "both"
-      - nft_collection_id : NFT collection object ID (when applicable)
-      - nft_threshold     : minimum NFT count required
-      - sui_rpc           : SUI RPC endpoint for client-side on-chain queries
-    """
-    # Use the static hosted page as the default.
-    base_url = "https://alphacity.tech/verify"
-    override_url = globals().get("WALLET_CONNECT_URL") or os.getenv('WALLET_CONNECT_URL', '').strip()
-    if override_url:
-        base_url = override_url
+    """Build a session-only URL for an allowlisted verification page."""
+    public_base = get_public_webapp_base_url()
+    local_base_url = f"{public_base.rstrip('/')}/verify" if public_base else FALLBACK_VERIFY_URL
+    base_url = local_base_url
+    if WALLET_CONNECT_URL:
+        parsed = urlsplit(WALLET_CONNECT_URL)
+        host = (parsed.hostname or '').lower()
+        is_local_dev = host in {'localhost', '127.0.0.1'} and parsed.scheme == 'http'
+        if (
+            parsed.scheme == 'https'
+            and host in WALLET_CONNECT_ALLOWED_HOSTS
+        ) or is_local_dev:
+            base_url = WALLET_CONNECT_URL
+        else:
+            logging.error(
+                "Ignoring WALLET_CONNECT_URL because its scheme/host is not allowlisted: %s",
+                WALLET_CONNECT_URL,
+            )
 
     separator = '&' if '?' in base_url else '?'
-    
-    # Generate verify_token at URL construction time since the page is hosted statically.
-    verify_token = _generate_verify_token(group_id, user_id)
-    
-    # Determine the bot's public base API URL for submitting verification payloads.
-    public_base = get_public_webapp_base_url()
+    verification_session = create_verification_session(group_id, user_id)
     if public_base:
         api_verify_url = f"{public_base.rstrip('/')}/api/verify"
     else:
         api_verify_url = "/api/verify"
 
     url = (
-        f"{base_url}{separator}group_id={group_id}"
-        f"&tg_user_id={user_id}"
-        f"&verify_token={quote(verify_token, safe='')}"
+        f"{base_url}{separator}verification_session={quote(verification_session, safe='')}"
     )
-
-    # Only append api_verify_url if it differs from the static page's default.
-    if api_verify_url != "https://token-gate-bot-production.up.railway.app/api/verify":
+    if base_url != local_base_url or api_verify_url.startswith('http'):
         url += f"&api_verify_url={quote(api_verify_url, safe='')}"
-
-    # Only append sui_rpc if it differs from the static page's default SUI RPC.
-    if SUI_RPC_URL != "https://fullnode.mainnet.sui.io:443":
-        url += f"&sui_rpc={quote(SUI_RPC_URL, safe='')}"
-
-    if cfg:
-        token = cfg.get("token", "")
-        minimum_holding = cfg.get("minimum_holding", 0)
-        decimals = cfg.get("decimals", 6)
-        registration_mode = cfg.get("registration_mode", "token")
-        nft_collection_id = cfg.get("nft_collection_id", "")
-        nft_threshold = cfg.get("nft_threshold", 1)
-
-        if registration_mode:
-            url += f"&registration_mode={registration_mode}"
-
-        if token and registration_mode in ("token", "both"):
-            url += f"&token_type={quote(token, safe='')}"
-            required_balance = int(round(minimum_holding * (10 ** decimals)))
-            url += f"&required_balance={required_balance}"
-            url += f"&decimals={decimals}"
-            url += f"&minimum_holding={minimum_holding}"
-
-        if nft_collection_id and registration_mode in ("nft", "both"):
-            url += f"&nft_collection_id={quote(nft_collection_id, safe='')}"
-            url += f"&nft_threshold={nft_threshold}"
 
     return url
 
@@ -4786,47 +5100,38 @@ def handle_wallet_webapp_data(message):
         or (payload.get('data') or {}).get('walletAddress')
         or ''
     ).strip()
-    payload_group_id = (
-        payload.get('group_id')
-        or payload.get('groupId')
-        or (payload.get('data') or {}).get('group_id')
-        or (payload.get('data') or {}).get('groupId')
-    )
-
-    # Extract verification result fields sent by the verify page.
-    # The mini-app performs on-chain balance/NFT checks client-side and sends
-    # the results here via tg.sendData().
-    balance_verified = payload.get('balance_verified')
-    if balance_verified is None:
-        balance_verified = (payload.get('data') or {}).get('balance_verified')
-    token_type = payload.get('token_type') or (payload.get('data') or {}).get('token_type') or ''
-    required_balance = payload.get('required_balance') or (payload.get('data') or {}).get('required_balance')
-    token_balance = payload.get('token_balance') or (payload.get('data') or {}).get('token_balance')
-    nft_count = payload.get('nft_count')
-    if nft_count is None:
-        nft_count = (payload.get('data') or {}).get('nft_count')
-    verify_token_val = payload.get('verify_token') or (payload.get('data') or {}).get('verify_token') or ''
+    payload_data = payload.get('data') or {}
+    verification_session = payload.get('verification_session') or payload_data.get('verification_session') or ''
+    wallet_signature = payload.get('wallet_signature') or payload_data.get('wallet_signature') or ''
 
     if not is_valid_wallet_address(wallet_address):
         bot.reply_to(message, "❌ Wallet verification failed: invalid wallet payload from WebApp.")
         return
+    wallet_address = require_canonical_sui_address(wallet_address)
 
-    group_id = None
-    if payload_group_id:
-        try:
-            group_id = int(payload_group_id)
-        except Exception:
-            group_id = None
+    session = get_active_verification_session(verification_session)
+    if not session or session["user_id"] != user_id:
+        bot.reply_to(message, "❌ This verification link is invalid, expired, or belongs to another Telegram user. Please run /register again.")
+        return
+    group_id = session["group_id"]
 
-    if group_id is None:
-        with get_db_cursor() as (conn, cur):
-            cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (user_id,))
-            row = cur.fetchone()
-        if row:
-            group_id = row[0]
-
-    if group_id is None:
-        bot.reply_to(message, "❌ No registration context found. Please run /register in the target group first.")
+    try:
+        ownership_message = build_wallet_ownership_message(verification_session, group_id, user_id, wallet_address)
+    except (ValueError, OverflowError):
+        bot.reply_to(message, "❌ Wallet verification failed: invalid Sui wallet address.")
+        return
+    try:
+        signature_valid = sui_gateway.verify_personal_message(
+            author=wallet_address,
+            message=ownership_message,
+            signature=wallet_signature,
+        )
+    except SuiGatewayError as exc:
+        logging.warning("Sui signature verification is unavailable: %s", exc)
+        bot.reply_to(message, "⚠️ Sui verification is temporarily unavailable. Please try this link again in a moment.")
+        return
+    if not signature_valid:
+        bot.reply_to(message, "❌ Wallet ownership signature could not be verified. Please reconnect your wallet and sign the verification message.")
         return
 
     if wallet_already_registered(wallet_address, group_id, user_id=user_id):
@@ -4839,53 +5144,42 @@ def handle_wallet_webapp_data(message):
         bot.reply_to(message, "❌ This group isn't set up yet. Ask an admin to run /cwconfig first.")
         return
 
-    # Always perform authoritative server-side verification regardless of what
-    # the client-side mini-app reports.  The mini-app does a client-side check
-    # purely for UX (instant feedback) but the bot must not trust it for access
-    # control since tg.sendData() content is user-controlled.
-    if balance_verified:
-        logging.info(
-            f"Mini-app reported client-side verification for user {user_id}, wallet {wallet_address}: "
-            f"token_type={token_type}, required_balance={required_balance}, "
-            f"token_balance={token_balance}, nft_count={nft_count} — re-verifying server-side"
-        )
-    requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
-
-    # Fallback: when the server-side RPC check fails but the client already
-    # verified successfully via a genuine /verify page load, accept the
-    # result instead of showing a confusing error.
-    requirement_eval = _apply_verify_token_fallback(
-        requirement_eval, balance_verified, verify_token_val, group_id, user_id,
-        "handle_wallet_webapp_data"
-    )
-
-    # Always save / update the wallet so the user's database record reflects
-    # the current registration mode and wallet list, even when requirements
-    # are not met right now (e.g. holdings changed, mode switched, etc.).
-    success = save_wallet_for_user(
-        group_id,
-        user_id,
-        message.from_user.username or message.from_user.first_name,
-        [wallet_address.lower()],
-        replace_existing=False,
-        registration_type=cfg.get("registration_mode", "token")
-    )
-
-    if not success:
-        bot.reply_to(message, "❌ Failed to save your wallet. Please try again later.")
+    if not claim_verification_session(verification_session, group_id, user_id):
+        bot.reply_to(message, "❌ This verification link is already being processed, used, or expired. Please try again shortly or run /register again.")
         return
 
-    # Persist any on-chain counts returned by the requirement evaluation
-    # (or from the client-side payload when the fallback was used) so the
-    # "View Wallets" display has data even when later RPC lookups fail.
+    requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=user_id, force_fresh=True)
+    if requirement_eval.get("status") == "indeterminate":
+        release_verification_session(verification_session, group_id, user_id)
+        bot.reply_to(
+            message,
+            "⚠️ Sui holdings could not be verified right now. Your link is still valid; please try again in a moment.",
+        )
+        return
+
+    try:
+        success = finalize_verified_wallet(
+            verification_session,
+            group_id,
+            user_id,
+            message.from_user.username or message.from_user.first_name,
+            wallet_address,
+            cfg.get("registration_mode", "token"),
+        )
+    except psycopg2.IntegrityError:
+        release_verification_session(verification_session, group_id, user_id)
+        bot.reply_to(message, "⚠️ This wallet address was just registered to another user in this group.")
+        return
+    if not success:
+        release_verification_session(verification_session, group_id, user_id)
+        bot.reply_to(message, "❌ Failed to complete verification. Please try again later.")
+        return
+
+    # Persist any authoritative on-chain counts so the "View Wallets" display
+    # has data even when later provider lookups fail.
     _nft = requirement_eval.get("nft_count")
     _trait = requirement_eval.get("trait_count")
     _bal = requirement_eval.get("token_balance")
-    if _nft is None and nft_count is not None:
-        try:
-            _nft = int(nft_count)
-        except (ValueError, TypeError):
-            pass
     if _nft is not None or _trait is not None or _bal is not None:
         try:
             update_user_cached_holdings(group_id, user_id, nft_count=_nft, trait_count=_trait, token_balance=_bal)
@@ -4974,15 +5268,43 @@ def _send_group_verified_notification(group_id, display_name):
 # ==================== Flask API Endpoints ========================
 
 def _add_cors_headers(response):
-    """Add CORS headers so the verify page can call /api/verify from any origin.
+    """Add credential-free CORS headers only for configured page origins."""
+    origin = (request.headers.get('Origin') or '').rstrip('/')
+    if origin and origin in CORS_ALLOWED_ORIGINS:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Vary'] = 'Origin'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    response.headers['Access-Control-Max-Age'] = '600'
+    return response
 
-    The allowed origin is controlled by the CORS_ALLOWED_ORIGIN environment
-    variable (default '*').  This API does not use cookies or credentials so
-    a wildcard origin does not introduce CSRF risk.
-    """
-    response.headers['Access-Control-Allow-Origin'] = CORS_ALLOWED_ORIGIN
-    response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Webhook-Secret'
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('Referrer-Policy', 'no-referrer')
+    response.headers.setdefault(
+        'Permissions-Policy',
+        'camera=(), microphone=(), geolocation=()',
+    )
+    if (
+        request.path.startswith('/verify')
+        or request.path.startswith('/wallet-connect')
+        or request.path.startswith('/api/verify')
+        or request.path.startswith('/api/verification')
+    ):
+        response.headers['Cache-Control'] = 'no-store, max-age=0'
+    if request.path.startswith('/verify') or request.path.startswith('/wallet-connect'):
+        response.headers.setdefault(
+            'Content-Security-Policy',
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://telegram.org; "
+            "connect-src 'self' https: http://localhost:* http://127.0.0.1:*; "
+            "img-src 'self' data: https:; "
+            "style-src 'unsafe-inline'; "
+            "object-src 'none'; base-uri 'none'; form-action 'none'; "
+            "frame-ancestors https://web.telegram.org https://*.telegram.org",
+        )
     return response
 
 
@@ -4999,64 +5321,21 @@ def home():
 @app.route('/wallet-connect')
 @app.route('/verify')
 def wallet_connect_webapp():
-    """Telegram mini-app for wallet verification.
+    """Serve the same session-bound signing flow used by the hosted page."""
+    verification_session = request.args.get('verification_session', '')
+    session = get_active_verification_session(verification_session)
+    if not session:
+        return "This verification link is invalid, expired, or was already used. Please run /register again.", 400
 
-    This page is designed to run entirely inside a Telegram WebApp so that
-    users never need to leave Telegram to verify their SUI wallet.  It
-    performs on-chain balance/NFT checks directly via the SUI JSON-RPC from
-    the client side and sends the verified result back to the bot via
-    ``tg.sendData()``.  An external-browser fallback (POST to /api/verify)
-    is kept for edge cases.
-    """
-    group_id = request.args.get('group_id', '') or request.args.get('groupId', '')
-    tg_user_id = request.args.get('tg_user_id', '') or request.args.get('tgUserId', '')
+    group_id = session["group_id"]
+    tg_user_id = session["user_id"]
+    with config_lock:
+        cfg = dict(SUBSCRIBER_CONFIGS.get(group_id, {}))
+    if not cfg:
+        return "This group is no longer configured. Please ask an administrator for help.", 400
 
-    # Sanitize to digits-only to prevent XSS – these are numeric IDs.
-    safe_group_id = re.sub(r'[^0-9\-]', '', group_id)
-    safe_tg_user_id = re.sub(r'[^0-9\-]', '', tg_user_id)
-
-    # JSON-encoded strings for safe embedding in JavaScript literals.
-    js_group_id = json.dumps(safe_group_id)
-    js_tg_user_id = json.dumps(safe_tg_user_id)
-
-    # Extract requirement params passed by build_wallet_connect_url().
-    raw_sui_rpc = request.args.get('sui_rpc', SUI_RPC_URL)
-    # Only allow HTTPS URLs for the client-side RPC endpoint.  The client-side
-    # check is purely for UX (instant feedback) — the server always re-verifies
-    # via its own trusted SUI_RPC_URL, so a tampered client RPC cannot bypass
-    # access control.
-    if not re.match(r'^https://', raw_sui_rpc):
-        raw_sui_rpc = SUI_RPC_URL
-    js_sui_rpc = json.dumps(raw_sui_rpc)
-
-    raw_token_type = request.args.get('token_type', '')
-    # Sanitize token_type: allow hex, colons, and alphanumeric (SUI type format).
-    safe_token_type = re.sub(r'[^0-9a-zA-Z:_]', '', raw_token_type)
-    js_token_type = json.dumps(safe_token_type)
-
-    raw_required_balance = request.args.get('required_balance', '0')
-    safe_required_balance = re.sub(r'[^0-9]', '', raw_required_balance) or '0'
-    raw_decimals = request.args.get('decimals', '6')
-    safe_decimals = re.sub(r'[^0-9]', '', raw_decimals) or '6'
-    raw_minimum_holding = request.args.get('minimum_holding', '0')
-    safe_minimum_holding = re.sub(r'[^0-9.]', '', raw_minimum_holding) or '0'
-
-    raw_reg_mode = request.args.get('registration_mode', 'token')
-    safe_reg_mode = re.sub(r'[^a-z]', '', raw_reg_mode) or 'token'
-    js_reg_mode = json.dumps(safe_reg_mode)
-
-    raw_nft_collection = request.args.get('nft_collection_id', '')
-    # Normalise the collection identifier so it works with both full type
-    # strings (0xPACKAGE::module::Struct) and plain hex addresses.
-    safe_nft_collection = _normalize_collection_id(raw_nft_collection)
-    # Sanitise: only allow characters valid in SUI addresses / type strings
-    safe_nft_collection = re.sub(r'[^0-9a-zA-Z_:]', '', safe_nft_collection)
-    js_nft_collection = json.dumps(safe_nft_collection)
-
-    raw_nft_threshold = request.args.get('nft_threshold', '1')
-    safe_nft_threshold = re.sub(r'[^0-9]', '', raw_nft_threshold) or '1'
-
-    # Build absolute API URL for the external-browser fallback path.
+    js_group_id = json.dumps(str(group_id))
+    js_tg_user_id = json.dumps(str(tg_user_id))
     public_base = get_public_webapp_base_url()
     if public_base:
         api_verify_url = urljoin(public_base.rstrip('/') + '/', 'api/verify')
@@ -5064,170 +5343,201 @@ def wallet_connect_webapp():
         api_verify_url = "/api/verify"
     js_api_verify_url = json.dumps(api_verify_url)
 
-    # Generate a signed token so api_verify / handle_wallet_webapp_data can
-    # confirm the request originated from a genuine /verify page load.
-    verify_token = _generate_verify_token(safe_group_id, safe_tg_user_id)
-    js_verify_token = json.dumps(verify_token)
+    js_verification_session = json.dumps(verification_session)
 
     # Render the verify page from the Jinja2 template.
     html = render_template(
         'verify.html',
         js_group_id=js_group_id,
         js_tg_user_id=js_tg_user_id,
-        js_sui_rpc=js_sui_rpc,
-        js_token_type=js_token_type,
-        safe_required_balance=safe_required_balance,
-        safe_decimals=safe_decimals,
-        safe_minimum_holding=safe_minimum_holding,
-        js_reg_mode=js_reg_mode,
-        js_nft_collection=js_nft_collection,
-        safe_nft_threshold=safe_nft_threshold,
         js_api_verify_url=js_api_verify_url,
-        js_verify_token=js_verify_token,
+        js_verification_session=js_verification_session,
     )
     return html
 
 
+@app.route('/api/verification-context', methods=['GET', 'OPTIONS'])
+def verification_context():
+    """Return sanitized server-owned context for a hosted signing page."""
+    if request.method == 'OPTIONS':
+        return _add_cors_headers(jsonify({}))
+    verification_session = request.args.get('verification_session', '')
+    rate_key = f"context:{request.remote_addr}:{verification_session}"
+    if not verification_rate_limiter.allow(rate_key):
+        return _add_cors_headers(jsonify({
+            'success': False,
+            'error': 'Too many requests. Please wait and try again.',
+        })), 429
+    session = get_active_verification_session(verification_session)
+    if not session:
+        return _add_cors_headers(jsonify({
+            'success': False,
+            'error': 'Verification link is invalid, expired, or already used.',
+        })), 404
+    with config_lock:
+        cfg = dict(SUBSCRIBER_CONFIGS.get(session['group_id'], {}))
+    if not cfg:
+        return _add_cors_headers(jsonify({
+            'success': False,
+            'error': 'Group is not configured.',
+        })), 404
+    response = jsonify({
+        'success': True,
+        'verification_session': verification_session,
+        'group_id': str(session['group_id']),
+        'telegram_user_id': str(session['user_id']),
+        'requirements': {
+            'registration_mode': cfg.get('registration_mode', 'token'),
+            'minimum_holding': str(cfg.get('minimum_holding', 0)),
+            'decimals': int(cfg.get('decimals', 6)),
+            'nft_threshold': int(cfg.get('nft_threshold', 1)),
+            'has_token_requirement': bool(cfg.get('token')),
+            'has_nft_requirement': bool(cfg.get('nft_collection_id')),
+            'has_trait_requirement': bool(cfg.get('nft_trait_name')),
+        },
+    })
+    return _add_cors_headers(response)
+
+
 @app.route('/api/verify', methods=['POST', 'OPTIONS'])
 def api_verify():
-    """REST endpoint for wallet verification submitted from an external browser.
-
-    The /verify page POSTs here when it detects it is NOT running inside a
-    Telegram WebApp (i.e. the URL-button flow from a group chat).  The endpoint
-    validates the wallet, saves it, and sends the confirmation (plus an invite
-    link) to the user via the Telegram bot.
-
-    External websites (e.g. token-gate-bot-production.up.railway.app/api/verify) can also call this endpoint
-    directly from their server or browser after a successful wallet verification,
-    without needing the user to manually run /register in Telegram.  To bypass
-    the on-chain requirement check and trust the website's own verification,
-    include the shared secret in an X-Webhook-Secret request header (set the
-    WEBHOOK_SECRET environment variable on both sides).
-    """
-    # Handle CORS preflight so browser-side calls from external domains succeed.
+    """Verify ownership and holdings using only server-owned configuration."""
     if request.method == 'OPTIONS':
-        response = jsonify({})
-        return _add_cors_headers(response)
+        return _add_cors_headers(jsonify({}))
 
+    verification_session = ''
+    group_id = None
+    tg_user_id = None
+    claimed = False
     try:
         data = request.get_json(silent=True) or {}
-
-        # Validate webhook secret when provided.  A correct secret tells us the
-        # call came from the trusted external website, so we can skip the
-        # redundant on-chain requirement check (the website already did it).
-        provided_secret = request.headers.get('X-Webhook-Secret', '')
-        webhook_authenticated = (
-            bool(WEBHOOK_SECRET)
-            and bool(provided_secret)
-            and hmac.compare_digest(
-                provided_secret.encode('utf-8'),
-                WEBHOOK_SECRET.encode('utf-8'),
-            )
-        )
+        if not isinstance(data, dict):
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'JSON object required',
+            })), 400
 
         wallet_address = (
             data.get('wallet_address') or data.get('walletAddress') or ''
         ).strip()
+        verification_session = data.get('verification_session') or data.get('verificationSession') or ''
+        wallet_signature = data.get('wallet_signature') or data.get('walletSignature') or ''
 
-        try:
-            group_id = int(data.get('group_id') or data.get('groupId') or 0)
-        except (ValueError, TypeError):
-            group_id = 0
-
-        try:
-            tg_user_id = int(data.get('tg_user_id') or data.get('tgUserId') or 0)
-        except (ValueError, TypeError):
-            tg_user_id = 0
-
+        rate_key = f"verify:{request.remote_addr}:{verification_session}"
+        if not verification_rate_limiter.allow(rate_key):
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Too many verification attempts. Please wait and try again.',
+            })), 429
         if not is_valid_wallet_address(wallet_address):
-            resp = jsonify({'success': False, 'error': 'Invalid wallet address'})
-            return _add_cors_headers(resp), 400
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Invalid wallet address',
+            })), 400
+        wallet_address = require_canonical_sui_address(wallet_address)
 
-        if not tg_user_id:
-            resp = jsonify({'success': False, 'error': 'Missing Telegram user ID'})
-            return _add_cors_headers(resp), 400
+        session = get_active_verification_session(verification_session)
+        if not session:
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Verification link is invalid, expired, or already used. Please run /register again.',
+            })), 400
+        group_id = session['group_id']
+        tg_user_id = session['user_id']
 
-        # Look up group_id from pending_verifications if not supplied
-        if not group_id:
-            with get_db_cursor() as (conn, cur):
-                cur.execute("SELECT group_id FROM pending_verifications WHERE user_id = %s", (tg_user_id,))
-                row = cur.fetchone()
-            if row:
-                group_id = row[0]
-
-        if not group_id:
-            resp = jsonify({'success': False, 'error': 'No registration context found. Please run /register in the target group first.'})
-            return _add_cors_headers(resp), 400
+        try:
+            ownership_message = build_wallet_ownership_message(verification_session, group_id, tg_user_id, wallet_address)
+        except ValueError:
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Invalid wallet address',
+            })), 400
+        try:
+            signature_valid = sui_gateway.verify_personal_message(
+                author=wallet_address,
+                message=ownership_message,
+                signature=wallet_signature,
+            )
+        except SuiGatewayError as exc:
+            logging.warning("api_verify: Sui signature verification unavailable: %s", exc)
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Sui verification is temporarily unavailable. Please try again.',
+                'retryable': True,
+            })), 503
+        if not signature_valid:
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Wallet ownership signature could not be verified.',
+            })), 403
 
         if wallet_already_registered(wallet_address, group_id, user_id=tg_user_id):
-            resp = jsonify({'success': False, 'error': 'Wallet already registered to another user in this group'})
-            cors_resp = _add_cors_headers(resp), 409
-            # Notify user in background to ensure CORS response is always returned promptly
             def _notify_duplicate(uid=tg_user_id):
                 try:
                     bot.send_message(uid, "⚠️ This wallet address is already registered to another user in this group.")
                 except Exception:
                     pass
-            _cleanup_executor.submit(_notify_duplicate)
-            return cors_resp
+            _background_executor.submit(_notify_duplicate)
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Wallet already registered to another user in this group',
+            })), 409
 
         with config_lock:
             cfg = SUBSCRIBER_CONFIGS.get(group_id)
         if not cfg:
-            resp = jsonify({'success': False, 'error': 'Group is not configured. Ask an admin to run /cwconfig first.'})
-            return _add_cors_headers(resp), 400
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Group is not configured. Ask an admin to run /cwconfig first.',
+            })), 400
 
-        # When the call comes from the trusted external website (valid webhook
-        # secret), trust its verification result and skip a redundant RPC check.
-        # Otherwise run the on-chain requirement evaluation ourselves.
-        if webhook_authenticated:
-            requirement_eval = {"requirements_met": True, "details": [], "errors": []}
-            source_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-            logging.info(
-                f"api_verify: webhook callback accepted from {source_ip} for user {tg_user_id}, "
-                f"wallet {wallet_address}, group {group_id}"
-            )
-        else:
-            # Brief pause to let SUI RPC rate-limits recover after the client-
-            # side verification that just completed (the verify page makes
-            # several RPC calls before posting here).
-            time.sleep(1)
-            requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
+        if not claim_verification_session(verification_session, group_id, tg_user_id):
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Verification link is already being processed, used, or expired.',
+            })), 409
+        claimed = True
 
-            # Fallback: when the server-side RPC check fails (e.g. rate-
-            # limiting after the client already hit the same RPC) but the
-            # request carries a valid page-session token AND the client
-            # reported that its own on-chain check passed, accept the result
-            # rather than showing a confusing "Unable to verify" error.
-            requirement_eval = _apply_verify_token_fallback(
-                requirement_eval, data.get('balance_verified'), data.get('verify_token', ''),
-                group_id, tg_user_id, "api_verify"
-            )
+        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
+        if requirement_eval.get('status') == 'indeterminate':
+            release_verification_session(verification_session, group_id, tg_user_id)
+            claimed = False
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Unable to verify on-chain holdings right now. Please try again.',
+                'details': requirement_eval.get('errors', []),
+                'retryable': True,
+            })), 503
 
-        # Resolve display name (best-effort)
         username = _get_user_display_name(tg_user_id)
-
-        # Always save / update the wallet so the user's database record
-        # reflects the current registration mode and wallet list, even when
-        # requirements are not met right now.
-        success = save_wallet_for_user(group_id, tg_user_id, username, [wallet_address.lower()], replace_existing=False, registration_type=cfg.get("registration_mode", "token"))
+        try:
+            success = finalize_verified_wallet(
+                verification_session,
+                group_id,
+                tg_user_id,
+                username,
+                wallet_address,
+                cfg.get("registration_mode", "token"),
+            )
+        except psycopg2.IntegrityError:
+            release_verification_session(verification_session, group_id, tg_user_id)
+            claimed = False
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Wallet already registered to another user in this group',
+            })), 409
         if not success:
-            resp = jsonify({'success': False, 'error': 'Failed to save wallet. Please try again later.'})
-            return _add_cors_headers(resp), 500
+            release_verification_session(verification_session, group_id, tg_user_id)
+            claimed = False
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Failed to complete verification. Please try again.',
+            })), 500
+        claimed = False
 
-        # Persist any on-chain counts returned by the requirement evaluation
-        # (or from the client-side payload when the fallback was used) so the
-        # "View Wallets" display has data even when later RPC lookups fail.
         _nft = requirement_eval.get("nft_count")
         _trait = requirement_eval.get("trait_count")
         _bal = requirement_eval.get("token_balance")
-        # When server-side RPC failed but client payload was accepted via the
-        # verify-token fallback, use the client-reported nft_count instead.
-        if _nft is None and data.get("nft_count") is not None:
-            try:
-                _nft = int(data["nft_count"])
-            except (ValueError, TypeError):
-                pass
         if _nft is not None or _trait is not None or _bal is not None:
             try:
                 update_user_cached_holdings(group_id, tg_user_id, nft_count=_nft, trait_count=_trait, token_balance=_bal)
@@ -5249,16 +5559,12 @@ def api_verify():
                 bot.send_message(tg_user_id, error_msg, parse_mode='Markdown')
             except Exception as e:
                 logging.debug(f"api_verify: could not send requirement error to user {tg_user_id}: {e}")
-            # Provide a more specific error message to the frontend when the
-            # failure is due to an RPC error rather than a genuine shortfall.
-            if requirement_eval.get('rpc_failed'):
-                resp_error = 'Unable to verify on-chain holdings right now. Please try again.'
-                status_code = 503
-            else:
-                resp_error = 'Wallet does not meet group requirements'
-                status_code = 403
-            resp = jsonify({'success': False, 'error': resp_error, 'details': eval_errors})
-            return _add_cors_headers(resp), status_code
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Wallet does not meet group requirements',
+                'details': eval_errors,
+                'retryable': False,
+            })), 403
 
         # Send confirmation to user and notify the group
         try:
@@ -5271,13 +5577,42 @@ def api_verify():
         _send_group_verified_notification(group_id, display_name)
 
         logging.info(f"api_verify: wallet {wallet_address} verified for user {tg_user_id} in group {group_id}")
-        resp = jsonify({'success': True, 'message': 'Wallet verified and registered successfully'})
-        return _add_cors_headers(resp)
+        return _add_cors_headers(jsonify({
+            'success': True,
+            'message': 'Wallet verified and registered successfully',
+        }))
 
     except Exception as e:
-        logging.error(f"Error in api_verify: {e}")
-        resp = jsonify({'success': False, 'error': 'Internal server error'})
-        return _add_cors_headers(resp), 500
+        logging.exception("Error in api_verify")
+        if claimed and verification_session and group_id is not None and tg_user_id is not None:
+            try:
+                release_verification_session(verification_session, group_id, tg_user_id)
+            except Exception:
+                logging.exception("Could not release failed verification session")
+        return _add_cors_headers(jsonify({
+            'success': False,
+            'error': 'Internal server error',
+        })), 500
+
+
+@app.route('/telegram/webhook', methods=['POST'])
+def telegram_webhook():
+    """Receive authenticated Telegram updates when webhook mode is enabled."""
+    if not TELEGRAM_WEBHOOK_URL or not TELEGRAM_WEBHOOK_SECRET:
+        return jsonify({"error": "webhook mode is disabled"}), 404
+    supplied_secret = request.headers.get(
+        'X-Telegram-Bot-Api-Secret-Token',
+        '',
+    )
+    if not secrets.compare_digest(supplied_secret, TELEGRAM_WEBHOOK_SECRET):
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        update = types.Update.de_json(request.get_data(as_text=True))
+        bot.process_new_updates([update])
+        return jsonify({"ok": True})
+    except Exception:
+        logging.exception("Failed to process Telegram webhook update")
+        return jsonify({"error": "invalid update"}), 400
 
 
 # ==================== Stripe Webhook & Subscription Routes ========
@@ -5314,14 +5649,6 @@ def stripe_webhook():
         session_data = event["data"]["object"]
         stripe_session_id = session_data.get("id", "")
 
-        # Idempotency check: skip if this session was already processed
-        if stripe_session_id:
-            with get_db_cursor() as (conn, cur):
-                cur.execute("SELECT 1 FROM stripe_processed_events WHERE session_id = %s", (stripe_session_id,))
-                if cur.fetchone():
-                    logging.info(f"Stripe session {stripe_session_id} already processed, skipping")
-                    return jsonify({"status": "ok"})
-
         metadata = session_data.get("metadata", {})
         group_id_str = metadata.get("group_id")
         user_id_str = metadata.get("user_id")
@@ -5331,16 +5658,13 @@ def stripe_webhook():
             try:
                 group_id = int(group_id_str)
                 user_id = int(user_id_str) if user_id_str else 0
-                new_expiry = activate_subscription(group_id, stripe_session_id, tier, user_id)
+                new_expiry, processed_now = activate_subscription_from_stripe(
+                    group_id, stripe_session_id, tier, user_id
+                )
+                if not processed_now:
+                    logging.info(f"Stripe session {stripe_session_id} already processed, skipping")
+                    return jsonify({"status": "ok"})
                 logging.info(f"Stripe payment completed: group={group_id}, tier={tier}, expires={new_expiry}")
-
-                # Record this session as processed for idempotency
-                if stripe_session_id:
-                    with get_db_cursor() as (conn, cur):
-                        cur.execute(
-                            "INSERT INTO stripe_processed_events (session_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                            (stripe_session_id,),
-                        )
 
                 # Notify the user via Telegram
                 if user_id:
@@ -5411,51 +5735,59 @@ def subscription_cancel():
 
 @app.route('/health')
 def health_check():
-    # Skip database check for frequent health checks to reduce costs
-    # Only check database if specifically requested with ?db=true
-    check_db = request.args.get('db') == 'true'
-
-    if check_db:
-        db_status = "healthy"
-        start_time = time.time()
-        try:
-            with get_db_cursor() as (conn, cur):
-                cur.execute("SELECT 1")
-                cur.fetchone()
-                db_response_time = time.time() - start_time
-        except Exception as e:
-            db_status = f"unhealthy: {str(e)}"
-            db_response_time = -1
-    else:
-        db_status = "not_checked"
-        db_response_time = None
-
-    bot_status = "healthy"
-    bot_start_time = time.time()
-    try:
-        bot.get_me()
-        bot_response_time = time.time() - bot_start_time
-    except Exception as e:
-        bot_status = f"unhealthy: {str(e)}"
-        bot_response_time = -1
-
-    is_healthy = (not check_db or db_status == "healthy") and (bot_status == "healthy")
-    response = jsonify({
-        "status": "healthy" if is_healthy else "unhealthy",
-        "database": {
-            "status": db_status,
-            "response_time_ms": round(db_response_time * 1000, 2) if db_response_time and db_response_time > 0 else None
-        },
-        "telegram_bot": {
-            "status": bot_status,
-            "response_time_ms": round(bot_response_time * 1000, 2) if bot_response_time > 0 else None
-        },
+    """Cheap liveness probe with no database or third-party network calls."""
+    return jsonify({
+        "status": "healthy",
+        "revision": CODE_SYNC_REV,
         "uptime_seconds": time.time() - APPLICATION_START_TIME,
-        "timestamp": time.time()
+        "timestamp": time.time(),
     })
-    if not is_healthy:
-        response.status_code = 503
-    return response
+
+
+_readiness_lock = threading.Lock()
+_readiness_cache = {"checked_at": 0.0, "payload": None, "status": 503}
+
+
+@app.route('/ready')
+def readiness_check():
+    """Cached readiness probe for PostgreSQL and the configured Sui provider."""
+    now = time.monotonic()
+    with _readiness_lock:
+        if (
+            _readiness_cache["payload"] is not None
+            and now - _readiness_cache["checked_at"] < 30
+        ):
+            return jsonify(_readiness_cache["payload"]), _readiness_cache["status"]
+
+    payload = {
+        "status": "ready",
+        "database": "healthy",
+        "sui_graphql": "healthy",
+        "chain_identifier": None,
+        "timestamp": time.time(),
+    }
+    status_code = 200
+    try:
+        with get_db_cursor() as (conn, cur):
+            cur.execute("SELECT 1")
+            cur.fetchone()
+    except Exception as exc:
+        payload["database"] = f"unhealthy: {type(exc).__name__}"
+        status_code = 503
+    try:
+        payload["chain_identifier"] = sui_gateway.chain_identifier()
+    except Exception as exc:
+        payload["sui_graphql"] = f"unhealthy: {type(exc).__name__}"
+        status_code = 503
+    if status_code != 200:
+        payload["status"] = "not_ready"
+    with _readiness_lock:
+        _readiness_cache.update({
+            "checked_at": now,
+            "payload": payload,
+            "status": status_code,
+        })
+    return jsonify(payload), status_code
 
 def is_valid_wallet_address(address):
     if not address:
@@ -5486,8 +5818,6 @@ if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", "5000"))
     HOST = "0.0.0.0"
     print(f"{BOT_NAME} is starting as a background worker...")
-
-    bot.remove_webhook()
 
     def keep_alive():
         cleanup_counter = 0
@@ -5571,13 +5901,37 @@ if __name__ == "__main__":
         error_backoff = 60  # Initial backoff for non-409 errors (seconds)
         max_error_backoff = 600  # Cap at 10 minutes
         while True:
+            if not refresh_telegram_poller_lease():
+                logging.info("Another instance holds the Telegram polling lease; waiting.")
+                time.sleep(45)
+                continue
+            lease_stop = threading.Event()
+
+            def renew_poller_lease():
+                while not lease_stop.wait(45):
+                    try:
+                        if not refresh_telegram_poller_lease():
+                            logging.error("Lost Telegram polling lease; stopping this poller.")
+                            bot.stop_polling()
+                            return
+                    except Exception:
+                        logging.exception("Could not renew Telegram polling lease")
+                        bot.stop_polling()
+                        return
+
+            renewal_thread = threading.Thread(
+                target=renew_poller_lease,
+                name="telegram-poller-lease",
+                daemon=True,
+            )
+            renewal_thread.start()
             try:
                 logging.info("Bot polling started with none_stop=True.")
                 bot.infinity_polling(
                     timeout=BOT_POLLING_TIMEOUT,
                     long_polling_timeout=BOT_LONG_POLLING_TIMEOUT,
                     none_stop=True,
-                    allowed_updates=None
+                    allowed_updates=TELEGRAM_ALLOWED_UPDATES,
                 )
                 conflict_count = 0  # Reset on successful polling
                 error_backoff = 60  # Reset backoff on success
@@ -5600,6 +5954,8 @@ if __name__ == "__main__":
                 logging.critical(f"CRITICAL ERROR in polling loop: {e}. Restarting polling in {error_backoff} seconds...")
                 time.sleep(error_backoff)
                 error_backoff = min(error_backoff * 2, max_error_backoff)
+            finally:
+                lease_stop.set()
 
 
     # Register bot commands for auto-completion
@@ -5648,13 +6004,40 @@ if __name__ == "__main__":
 
     register_bot_commands()
 
-    polling_thread = threading.Thread(target=start_polling)
-    polling_thread.daemon = True
-    polling_thread.start()
+    if TELEGRAM_WEBHOOK_URL:
+        if not TELEGRAM_WEBHOOK_SECRET:
+            raise ValueError("TELEGRAM_WEBHOOK_SECRET is required in webhook mode")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", TELEGRAM_WEBHOOK_SECRET):
+            raise ValueError("TELEGRAM_WEBHOOK_SECRET contains unsupported characters")
+        parsed_webhook = urlsplit(TELEGRAM_WEBHOOK_URL)
+        if parsed_webhook.scheme != 'https' or not parsed_webhook.netloc:
+            raise ValueError("TELEGRAM_WEBHOOK_URL must be an absolute HTTPS URL")
+        webhook_url = TELEGRAM_WEBHOOK_URL.rstrip('/')
+        if not webhook_url.endswith('/telegram/webhook'):
+            webhook_url += '/telegram/webhook'
+        bot.remove_webhook()
+        bot.set_webhook(
+            url=webhook_url,
+            secret_token=TELEGRAM_WEBHOOK_SECRET,
+            allowed_updates=TELEGRAM_ALLOWED_UPDATES,
+        )
+        logging.info("Telegram webhook mode enabled at %s", webhook_url)
+    else:
+        bot.remove_webhook()
+        polling_thread = threading.Thread(
+            target=start_polling,
+            name="telegram-poller",
+            daemon=True,
+        )
+        polling_thread.start()
 
     try:
         while True:
             time.sleep(60)
     except KeyboardInterrupt:
         print("Application shutting down...")
+        bot.stop_polling()
+        _delayed_tasks.close()
+        _background_executor.shutdown(wait=False, cancel_futures=True)
+        _sui_executor.shutdown(wait=False, cancel_futures=True)
         sys.exit(0)
