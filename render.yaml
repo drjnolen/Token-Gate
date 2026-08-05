@@ -41,5 +41,18 @@ services:
         value: "10"
       - key: SUI_FETCH_WORKERS
         value: "8"
+      - key: SUI_OPERATION_TIMEOUT_SECONDS
+        value: "90"
+      - key: SUI_MAX_PAGES
+        value: "200"
+      - key: SUI_MAX_OBJECTS
+        value: "10000"
       - key: WALLET_CHECK_INTERVAL_SECONDS
         value: "172800"
+      - key: AUTO_REMOVE_GRACE_SECONDS
+        value: "86400"
+      - key: VERIFY_SESSION_MAX_ATTEMPTS
+        value: "10"
+      # Optional: enables the bearer-protected /metrics endpoint.
+      - key: METRICS_TOKEN
+        sync: false

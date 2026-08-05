@@ -42,6 +42,40 @@ class SlidingWindowRateLimiter:
             return True
 
 
+class RuntimeMetrics:
+    """Thread-safe, process-local counters and duration summaries."""
+
+    def __init__(self):
+        self._counters: dict[str, int] = defaultdict(int)
+        self._durations: dict[str, dict[str, float]] = {}
+        self._lock = threading.Lock()
+
+    def increment(self, name: str, amount: int = 1) -> None:
+        with self._lock:
+            self._counters[name] += int(amount)
+
+    def observe(self, name: str, seconds: float) -> None:
+        value = max(0.0, float(seconds))
+        with self._lock:
+            summary = self._durations.setdefault(
+                name,
+                {"count": 0, "total_seconds": 0.0, "max_seconds": 0.0},
+            )
+            summary["count"] += 1
+            summary["total_seconds"] += value
+            summary["max_seconds"] = max(summary["max_seconds"], value)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "counters": dict(self._counters),
+                "durations": {
+                    name: dict(summary)
+                    for name, summary in self._durations.items()
+                },
+            }
+
+
 class DelayedTaskScheduler:
     """Run delayed callbacks without occupying a worker thread while waiting."""
 

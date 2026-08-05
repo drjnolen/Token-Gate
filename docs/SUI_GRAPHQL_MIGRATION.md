@@ -21,6 +21,16 @@ It never decides whether a user satisfies a gate.
 - `CORS_ALLOWED_ORIGINS`: `https://alphacity.tech,https://www.alphacity.tech`
 - `PUBLIC_WEBAPP_BASE_URL`: the public HTTPS origin of this bot, when the
   platform does not provide `RENDER_EXTERNAL_URL`.
+- `SUI_OPERATION_TIMEOUT_SECONDS`: overall deadline for one holdings
+  operation (default `90`).
+- `SUI_MAX_PAGES` and `SUI_MAX_OBJECTS`: traversal safety budgets (defaults
+  `200` and `10000`).
+- `AUTO_REMOVE_GRACE_SECONDS`: default grace period for newly configured
+  groups (default `86400`; admins can override it in `/cwconfig`).
+- `VERIFY_SESSION_MAX_ATTEMPTS`: database-enforced submission limit per
+  verification link (default `10`).
+- `METRICS_TOKEN`: optional bearer token that enables the otherwise hidden
+  JSON `/metrics` endpoint.
 
 The public Mysten GraphQL endpoint remains a development fallback only.
 
@@ -48,6 +58,37 @@ Wallet persistence and session completion share one database transaction.
 `user_wallet_addresses` enforces one owner per wallet per group while the
 existing JSON wallet list remains as a compatibility projection.
 
+Externally hosted verification links carry their single-use session in the URL
+fragment, so it is not sent to the static host or CDN. The page converts legacy
+query-string links into fragments immediately and removes the fragment after a
+terminal result.
+
+## Enforcement and voting safety
+
+- Auto-removal begins with a configurable grace period.
+- When the grace period expires, the bot performs a final uncached balance
+  read. Provider failure defers removal.
+- Removal is implemented as Telegram ban + immediate unban, so the member can
+  re-register and rejoin after restoring holdings.
+- Warnings, deferrals, recoveries, failures, and removals are retained in
+  `enforcement_events` for 90 days.
+- Weighted polls use the first authoritative cast-time holdings result as an
+  immutable per-poll snapshot. Changing an option does not re-weight the vote.
+- Provider failure never records a zero-weight vote.
+
+## Verification UI synchronization
+
+`templates/verify.html`, `static/verify.js`, and `static/verify.css` are the
+canonical source. Export them to an Alphacity checkout with:
+
+```text
+python scripts/sync_verify_page.py /path/to/Alphacity
+python scripts/sync_verify_page.py --check /path/to/Alphacity
+```
+
+The exporter preserves Alphacity telemetry tags and generates its verification
+page regression test.
+
 ## Deployment order
 
 1. Deploy the Token-Gate backend with `WALLET_CONNECT_URL` temporarily unset.
@@ -70,5 +111,11 @@ Alert on:
 - repeated `All Sui GraphQL providers failed` messages;
 - sessions repeatedly recovered from stale `processing` state;
 - Telegram polling lease loss or webhook authentication failures.
+
+Group administrators can run `/cwstatus` for the deployed revision, latest
+wallet-scan state, active verification count, members in grace, last
+enforcement event, and credential-free GraphQL circuit status. The optional
+`/metrics` endpoint exposes aggregate counters and timings without wallet or
+Telegram identifiers.
 
 The liveness `/health` endpoint intentionally performs no third-party calls.
