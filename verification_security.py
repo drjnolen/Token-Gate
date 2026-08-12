@@ -1,5 +1,15 @@
 """Canonical inputs for provider-verified Sui wallet ownership."""
 
+import re
+
+
+_VERIFICATION_SESSION_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+
+
+def is_valid_verification_session_id(value: str) -> bool:
+    """Return whether a value can be one of our URL-safe session secrets."""
+    return isinstance(value, str) and bool(_VERIFICATION_SESSION_PATTERN.fullmatch(value))
+
 
 def canonical_sui_address(address: str) -> str | None:
     """Return a normalized 32-byte Sui address, or ``None`` when invalid."""
@@ -9,11 +19,7 @@ def canonical_sui_address(address: str) -> str | None:
     if not value.startswith("0x"):
         return None
     body = value[2:]
-    if not body or len(body) > 64:
-        return None
-    try:
-        int(body, 16)
-    except ValueError:
+    if not body or len(body) > 64 or re.fullmatch(r"[0-9a-f]+", body) is None:
         return None
     return "0x" + body.zfill(64)
 

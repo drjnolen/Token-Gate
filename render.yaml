@@ -6,8 +6,8 @@ services:
     startCommand: python main.py
     healthCheckPath: /health
     # Render exposes the PORT env var; main.py already reads it (default 5000).
-    # The public URL is available as RENDER_EXTERNAL_URL, which main.py uses
-    # to build the /verify WebApp URL when WALLET_CONNECT_URL is not set.
+    # The public URL is available as RENDER_EXTERNAL_URL and is embedded only
+    # as the backend API origin in the fragment-scoped Alpha City link.
     envVars:
       # ── Required ───────────────────────────────────────────────────────────
       - key: TELEGRAM_BOT_TOKEN
@@ -16,12 +16,15 @@ services:
         sync: false          # Set this secret in the Render dashboard
       # ── Optional / recommended ─────────────────────────────────────────────
       - key: WALLET_CONNECT_URL
-        value: ""
+        value: https://alphacity.tech/verify/
       - key: WALLET_CONNECT_ALLOWED_HOSTS
         value: alphacity.tech,www.alphacity.tech
       # RENDER_EXTERNAL_URL is injected automatically by Render.
       # PUBLIC_WEBAPP_BASE_URL is only needed if you want to override it.
       - key: PUBLIC_WEBAPP_BASE_URL
+        value: ""
+      # Optional explicit backend origin. RENDER_EXTERNAL_URL is used when blank.
+      - key: PUBLIC_API_BASE_URL
         value: ""
       - key: CORS_ALLOWED_ORIGINS
         value: https://alphacity.tech,https://www.alphacity.tech
@@ -53,6 +56,14 @@ services:
         value: "86400"
       - key: VERIFY_SESSION_MAX_ATTEMPTS
         value: "10"
+      - key: VERIFY_SESSION_TIMEOUT_SECONDS
+        value: "900"
+      - key: VERIFY_PROCESSING_LEASE_SECONDS
+        value: "300"
+      - key: WAITRESS_THREADS
+        value: "12"
+      - key: VERIFY_CONCURRENT_REQUESTS
+        value: "6"
       # Optional: enables the bearer-protected /metrics endpoint.
       - key: METRICS_TOKEN
         sync: false

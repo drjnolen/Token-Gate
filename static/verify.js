@@ -9,6 +9,9 @@
 
   const DEFAULT_API_VERIFY_URL =
     'https://token-gate-bot-production.up.railway.app/api/verify';
+  const CONTEXT_TIMEOUT_MS = 20000;
+  const SUBMISSION_TIMEOUT_MS = 210000;
+  const SUI_MAINNET_CHAIN = 'sui:mainnet';
   const ALLOWED_API_HOSTS = new Set([
     'token-gate-bot-production.up.railway.app',
     'token-gate-bot.onrender.com',
@@ -22,24 +25,34 @@
   const serverSession = body.dataset.verificationSession || '';
   const requestedApiValue = serverApiUrl || hash.get('api_verify_url') ||
     query.get('api_verify_url') || DEFAULT_API_VERIFY_URL;
-  const requestedApiUrl = new URL(requestedApiValue, window.location.href);
-  const isLocalApi = ['localhost', '127.0.0.1'].includes(requestedApiUrl.hostname) &&
-    requestedApiUrl.protocol === 'http:';
-  const apiHostAllowed = Boolean(serverApiUrl) || (
-    ALLOWED_API_HOSTS.has(requestedApiUrl.hostname) &&
-    (requestedApiUrl.protocol === 'https:' || isLocalApi)
-  );
-  const API_VERIFY_URL = (
-    apiHostAllowed ? requestedApiUrl : new URL(DEFAULT_API_VERIFY_URL)
-  ).toString();
+  let requestedApiUrl = null;
+  let apiConfigurationError = '';
+  try {
+    requestedApiUrl = new URL(requestedApiValue, window.location.href);
+    const isLocalApi = ['localhost', '127.0.0.1'].includes(requestedApiUrl.hostname) &&
+      requestedApiUrl.protocol === 'http:';
+    const apiHostAllowed = ALLOWED_API_HOSTS.has(requestedApiUrl.hostname) &&
+      (requestedApiUrl.protocol === 'https:' || isLocalApi);
+    const apiPathAllowed = requestedApiUrl.pathname.replace(/\/$/, '') === '/api/verify';
+    if (!apiHostAllowed || !apiPathAllowed || requestedApiUrl.username ||
+        requestedApiUrl.password || requestedApiUrl.search || requestedApiUrl.hash) {
+      throw new Error('untrusted verification API URL');
+    }
+  } catch (_) {
+    apiConfigurationError =
+      'This verification link names an invalid service. Request a new link in Telegram.';
+  }
+  const API_VERIFY_URL = apiConfigurationError ? '' : requestedApiUrl.toString();
   const VERIFICATION_SESSION = serverSession ||
     hash.get('verification_session') ||
     query.get('verification_session') ||
     '';
-  const CONTEXT_URL = API_VERIFY_URL.replace(
-    /\/api\/verify(?:\?.*)?$/,
-    '/api/verification-context'
-  ) + '?verification_session=' + encodeURIComponent(VERIFICATION_SESSION);
+  const contextUrl = API_VERIFY_URL ? new URL(API_VERIFY_URL) : null;
+  if (contextUrl) {
+    contextUrl.pathname = '/api/verification-context';
+    contextUrl.searchParams.set('verification_session', VERIFICATION_SESSION);
+  }
+  const CONTEXT_URL = contextUrl ? contextUrl.toString() : '';
   const telegram = window.Telegram && window.Telegram.WebApp;
   const registeredWallets = new Set();
 
@@ -49,6 +62,9 @@
   let selectedAddress = '';
   let selectedSignature = '';
   let restartUrl = '';
+  let telegramReturnUrl = '';
+  let contextLoading = false;
+  let submissionInFlight = false;
 
   const walletCard = document.getElementById('walletCard');
   const discoverButton = document.getElementById('discoverButton');
@@ -66,16 +82,34 @@
     cleanUrl.searchParams.delete('verification_session');
     cleanUrl.searchParams.delete('api_verify_url');
     if (!serverSession) {
-      cleanUrl.hash = new URLSearchParams({
-        verification_session: VERIFICATION_SESSION,
-        api_verify_url: API_VERIFY_URL
-      }).toString();
+      const fragment = new URLSearchParams({
+        verification_session: VERIFICATION_SESSION
+      });
+      if (API_VERIFY_URL) fragment.set('api_verify_url', API_VERIFY_URL);
+      cleanUrl.hash = fragment.toString();
     }
     window.history.replaceState(null, '', cleanUrl);
   }
 
   if (telegram) {
     try { telegram.ready(); telegram.expand(); } catch (_) {}
+  }
+
+  function isRealTelegramContext() {
+    return Boolean(
+      window.TelegramWebviewProxy ||
+      (telegram && telegram.initData) ||
+      (telegram && telegram.platform && telegram.platform !== 'unknown')
+    );
+  }
+
+  function track(eventName, properties) {
+    try {
+      if (window.AlphaCityTelemetry &&
+          typeof window.AlphaCityTelemetry.track === 'function') {
+        window.AlphaCityTelemetry.track(eventName, properties || {});
+      }
+    } catch (_) {}
   }
 
   function showNotice(id, message, kind) {
@@ -138,6 +172,10 @@
 
   function toBase64(value) {
     if (typeof value === 'string') return value;
+    if (value instanceof ArrayBuffer) value = new Uint8Array(value);
+    if (ArrayBuffer.isView(value) && !(value instanceof Uint8Array)) {
+      value = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
     if (!(value instanceof Uint8Array)) return '';
     let binary = '';
     value.forEach(byte => { binary += String.fromCharCode(byte); });
@@ -186,19 +224,21 @@
   }
 
   function walletAppReadyEvent(api) {
-    const event = new Event('wallet-standard:app-ready');
-    event.detail = api;
-    return event;
+    return new CustomEvent('wallet-standard:app-ready', { detail: api });
   }
 
   function initWalletStandard() {
     const api = Object.freeze({
       register(...wallets) {
-        wallets.forEach(wallet => registeredWallets.add(wallet));
+        const added = wallets.filter(Boolean);
+        added.forEach(wallet => registeredWallets.add(wallet));
+        return () => added.forEach(wallet => registeredWallets.delete(wallet));
       }
     });
     window.addEventListener('wallet-standard:register-wallet', event => {
-      if (event.detail && typeof event.detail === 'function') event.detail(api);
+      if (event.detail && typeof event.detail === 'function') {
+        try { event.detail(api); } catch (_) {}
+      }
     });
     try { window.dispatchEvent(walletAppReadyEvent(api)); } catch (_) {}
   }
@@ -209,7 +249,7 @@
     const add = wallet => {
       if (!wallet || seen.has(wallet.name)) return;
       const chains = wallet.chains || [];
-      if (chains.length && !chains.some(chain => String(chain).startsWith('sui:'))) return;
+      if (chains.length && !chains.includes(SUI_MAINNET_CHAIN)) return;
       seen.add(wallet.name);
       wallets.push(wallet);
     };
@@ -223,13 +263,12 @@
       Array.from(direct || []).forEach(add);
     }
     [
-      ['suiWallet', 'Sui Wallet'],
-      ['slush', 'Slush'],
-      ['suiet', 'Suiet'],
-      ['nightly', 'Nightly'],
-      ['martian', 'Martian']
-    ].forEach(([key, name]) => {
-      const provider = window[key];
+      [window.suiWallet, 'Sui Wallet'],
+      [window.slush && (window.slush.sui || window.slush), 'Slush'],
+      [window.suiet, 'Suiet'],
+      [window.nightly, 'Nightly'],
+      [window.martian, 'Martian']
+    ].forEach(([provider, name]) => {
       if (provider) {
         add({
           name,
@@ -256,6 +295,13 @@
       ? rawAccount
       : rawAccount && rawAccount.address;
     if (!isValidAddress(address)) return null;
+    const chains = rawAccount && Array.isArray(rawAccount.chains)
+      ? rawAccount.chains
+      : [];
+    if (chains.length && !chains.includes(SUI_MAINNET_CHAIN)) return null;
+    if (rawAccount && rawAccount.chain && rawAccount.chain !== SUI_MAINNET_CHAIN) {
+      return null;
+    }
     return {
       raw: rawAccount,
       address: canonicalAddress(address),
@@ -287,12 +333,38 @@
       .map(account => accountDetails(account, wallet.name))
       .filter(Boolean);
     if (!normalized.length) throw new Error('The wallet did not return a valid Sui account.');
+    if (wallet._provider) wallet._connectedAccountCount = normalized.length;
     return normalized;
+  }
+
+  async function activateLegacyAccount(wallet, account, address) {
+    const provider = wallet._provider;
+    if (!provider || (wallet._connectedAccountCount || 0) < 2) return;
+    const requestedAddress = typeof account === 'string'
+      ? account
+      : (account && account.address) || address;
+    if (typeof provider.switchAccount === 'function') {
+      await provider.switchAccount(requestedAddress);
+    } else if (typeof provider.selectAccount === 'function') {
+      await provider.selectAccount(requestedAddress);
+    } else if (typeof provider.connect === 'function') {
+      await provider.connect({ account: requestedAddress, onlyIfTrusted: false });
+    } else {
+      throw new Error('Switch to this account inside your wallet, then reconnect.');
+    }
+    const active = (provider.account && provider.account.address) ||
+      provider.selectedAddress || provider.address || '';
+    if (active && (!isValidAddress(active) || canonicalAddress(active) !== address)) {
+      throw new Error('The wallet did not switch to the selected account.');
+    }
   }
 
   async function signOwnership(wallet, account, address) {
     const message = new TextEncoder().encode(ownershipMessage(address));
-    for (const key of ['sui:signPersonalMessage', 'standard:signMessage']) {
+    for (const key of [
+      'sui:signPersonalMessage',
+      'sui:signMessage'
+    ]) {
       const feature = wallet.features && wallet.features[key];
       const sign = feature && (feature.signPersonalMessage || feature.signMessage);
       if (typeof sign !== 'function') continue;
@@ -301,13 +373,15 @@
       const signature = result && toBase64(result.signature);
       if (signature) return signature;
     }
+    await activateLegacyAccount(wallet, account, address);
+    const legacyInput = { message, account, address };
     if (wallet._provider && typeof wallet._provider.signPersonalMessage === 'function') {
-      const result = await wallet._provider.signPersonalMessage({ message });
+      const result = await wallet._provider.signPersonalMessage(legacyInput);
       const signature = result && toBase64(result.signature);
       if (signature) return signature;
     }
     if (wallet._provider && typeof wallet._provider.signMessage === 'function') {
-      const result = await wallet._provider.signMessage({ message });
+      const result = await wallet._provider.signMessage(legacyInput);
       const signature = result && toBase64(result.signature);
       if (signature) return signature;
     }
@@ -361,10 +435,7 @@
     walletList.textContent = '';
     walletList.hidden = false;
     if (!wallets.length) {
-      const inTelegram = Boolean(
-        window.TelegramWebviewProxy ||
-        (telegram && telegram.platform && telegram.platform !== 'unknown')
-      );
+      const inTelegram = isRealTelegramContext();
       showNotice(
         'walletNotice',
         inTelegram
@@ -419,6 +490,10 @@
           walletList.hidden = true;
           renderAccounts(accounts);
           clearNotice('walletNotice');
+          track('wallet_connect', {
+            status: 'success',
+            provider: walletTelemetryProvider(wallet.name)
+          });
         } catch (error) {
           hint.textContent = 'Connect';
           Array.from(walletList.querySelectorAll('button')).forEach(item => {
@@ -429,6 +504,10 @@
             error.message || 'Wallet connection was cancelled.',
             'error'
           );
+          track('wallet_connect', {
+            status: 'failure',
+            provider: walletTelemetryProvider(wallet.name)
+          });
         } finally {
           setBusy(false);
         }
@@ -443,27 +522,72 @@
     document.getElementById('resultNewLinkButton').hidden = !hasRestart;
   }
 
-  async function loadContext() {
-    setBusy(true);
-    contextRecovery.hidden = true;
-    clearNotice('walletNotice');
-    if (!VERIFICATION_SESSION) throw new Error('The verification session is missing.');
-    const response = await fetch(CONTEXT_URL, {
-      headers: { Accept: 'application/json' },
-      cache: 'no-store'
-    });
-    const result = await response.json();
-    if (!response.ok || !result.success) {
-      restartUrl = result.restart_url || '';
-      throw new Error(result.error || 'This verification link is unavailable.');
+  function walletTelemetryProvider(name) {
+    const normalized = String(name || '').toLowerCase();
+    for (const provider of ['slush', 'phantom', 'suiet', 'nightly', 'martian']) {
+      if (normalized.includes(provider)) return provider;
     }
-    context = result;
-    restartUrl = result.restart_url || '';
-    setRecoveryButtons();
-    renderRequirements();
-    discoverButton.disabled = false;
-    discoverButton.textContent = 'Find Sui wallets';
-    walletCard.setAttribute('aria-busy', 'false');
+    if (normalized.includes('sui wallet')) return 'sui_wallet';
+    return 'other';
+  }
+
+  async function fetchJsonWithTimeout(url, options, timeoutMs) {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      let result;
+      try {
+        result = await response.json();
+      } catch (_) {
+        throw new Error('The verification service returned an invalid response.');
+      }
+      return { response, result };
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+
+  async function loadContext() {
+    if (contextLoading) return;
+    contextLoading = true;
+    document.getElementById('contextRetryButton').disabled = true;
+    try {
+      setBusy(true);
+      contextRecovery.hidden = true;
+      clearNotice('walletNotice');
+      if (apiConfigurationError) throw new Error(apiConfigurationError);
+      if (!VERIFICATION_SESSION) throw new Error('The verification session is missing.');
+      const { response, result } = await fetchJsonWithTimeout(
+        CONTEXT_URL,
+        {
+          headers: { Accept: 'application/json' },
+          cache: 'no-store'
+        },
+        CONTEXT_TIMEOUT_MS
+      );
+      restartUrl = result.restart_url || '';
+      telegramReturnUrl = result.telegram_return_url || '';
+      setRecoveryButtons();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'This verification link is unavailable.');
+      }
+      if (result.verification_completed && result.verification_result) {
+        showResult(
+          result.verification_result,
+          Boolean(result.verification_result.success)
+        );
+        return;
+      }
+      context = result;
+      renderRequirements();
+      discoverButton.disabled = false;
+      discoverButton.textContent = 'Find Sui wallets';
+    } finally {
+      contextLoading = false;
+      document.getElementById('contextRetryButton').disabled = false;
+      walletCard.setAttribute('aria-busy', 'false');
+    }
   }
 
   function scrubSensitiveUrl() {
@@ -477,6 +601,8 @@
 
   function showResult(result, responseOk) {
     setStep(3);
+    document.getElementById('retryButton').hidden = true;
+    clearNotice('resultNotice');
     const success = responseOk && result.success;
     const registeredButIneligible = Boolean(
       result.wallet_registered && result.eligibility_status === 'fail'
@@ -491,6 +617,7 @@
         'Check Telegram for your confirmation and group link.',
         'success'
       );
+      track('gate_check', { result: 'pass', source: 'wallet_verification' });
       scrubSensitiveUrl();
       return;
     }
@@ -505,6 +632,7 @@
         'Your wallet was saved. Update your holdings and request a new verification link when ready.',
         'warning'
       );
+      track('gate_check', { result: 'fail', source: 'wallet_verification' });
       scrubSensitiveUrl();
       return;
     }
@@ -516,39 +644,43 @@
       document.getElementById('retryButton').hidden = false;
       showNotice('resultNotice', 'Your verification link is still valid.', 'error');
     }
+    track('gate_check', { result: 'error', source: 'wallet_verification' });
   }
 
   async function submitVerification() {
-    if (!selectedAddress || !selectedSignature) return;
+    if (!selectedAddress || !selectedSignature || submissionInFlight) return;
+    submissionInFlight = true;
+    submitButton.disabled = true;
+    document.getElementById('retryButton').disabled = true;
     setStep(2);
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 150000);
-      const response = await fetch(API_VERIFY_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json'
+      const { response, result } = await fetchJsonWithTimeout(
+        API_VERIFY_URL,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json'
+          },
+          cache: 'no-store',
+          body: JSON.stringify({
+            verification_session: VERIFICATION_SESSION,
+            wallet_address: selectedAddress,
+            wallet_signature: selectedSignature
+          })
         },
-        cache: 'no-store',
-        signal: controller.signal,
-        body: JSON.stringify({
-          verification_session: VERIFICATION_SESSION,
-          wallet_address: selectedAddress,
-          wallet_signature: selectedSignature
-        })
-      });
-      clearTimeout(timeout);
-      const result = await response.json();
+        SUBMISSION_TIMEOUT_MS
+      );
       restartUrl = result.restart_url || restartUrl;
+      telegramReturnUrl = result.telegram_return_url || telegramReturnUrl;
       setRecoveryButtons();
       showResult(result, response.ok);
     } catch (error) {
       setStep(3);
       document.getElementById('resultIcon').textContent = '⚠️';
-      document.getElementById('resultTitle').textContent = 'Network error';
+      document.getElementById('resultTitle').textContent = 'Result not confirmed';
       document.getElementById('resultMessage').textContent =
-        'No result was recorded. Please retry.';
+        'The server response was interrupted. Try again to safely check the same registration.';
       document.getElementById('retryButton').hidden = false;
       showNotice(
         'resultNotice',
@@ -557,16 +689,24 @@
           : 'Could not reach the server.',
         'error'
       );
+      track('client_error', {
+        area: 'verification_submit',
+        code: error.name || 'network_error'
+      });
+    } finally {
+      submissionInFlight = false;
+      submitButton.disabled = false;
+      document.getElementById('retryButton').disabled = false;
     }
   }
 
   function returnToTelegram() {
-    if (telegram && typeof telegram.close === 'function') {
+    if (isRealTelegramContext() && telegram && typeof telegram.close === 'function') {
       telegram.close();
       return;
     }
-    if (restartUrl) {
-      window.location.assign(restartUrl);
+    if (telegramReturnUrl) {
+      window.location.assign(telegramReturnUrl);
       return;
     }
     window.history.back();
@@ -579,7 +719,7 @@
   discoverButton.addEventListener('click', () => {
     clearNotice('walletNotice');
     if (discoverButton.dataset.external === 'true') {
-      if (telegram && typeof telegram.openLink === 'function') {
+      if (isRealTelegramContext() && telegram && typeof telegram.openLink === 'function') {
         telegram.openLink(window.location.href);
       } else {
         window.open(window.location.href, '_blank', 'noopener');
@@ -606,6 +746,7 @@
       submitButton.hidden = false;
       submitButton.disabled = false;
       clearNotice('walletNotice');
+      track('transaction_sign', { status: 'success' });
     } catch (error) {
       signButton.disabled = false;
       showNotice(
@@ -613,6 +754,7 @@
         error.message || 'Signature request was cancelled.',
         'error'
       );
+      track('transaction_sign', { status: 'failure' });
     } finally {
       setBusy(false);
     }

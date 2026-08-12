@@ -16,8 +16,14 @@ It never decides whether a user satisfies a gate.
 
 - `SUI_GRAPHQL_URLS`: comma-separated production GraphQL endpoints. Put the
   preferred provider first and a separately operated provider second.
-- `WALLET_CONNECT_URL`: `https://alphacity.tech/verify/`
+- `WALLET_CONNECT_URL`: defaults to and should remain
+  `https://alphacity.tech/verify/`. The process validates the HTTPS host and
+  exact `/verify/` path at startup.
 - `WALLET_CONNECT_ALLOWED_HOSTS`: `alphacity.tech,www.alphacity.tech`
+- `PUBLIC_API_BASE_URL`: optional explicit HTTPS origin for the Token-Gate
+  backend. When blank, the platform-provided Render/Railway origin is used.
+  It must be one of the backend hosts allowlisted by the synchronized hosted
+  verifier; changing domains requires deploying both repositories together.
 - `CORS_ALLOWED_ORIGINS`: `https://alphacity.tech,https://www.alphacity.tech`
 - `PUBLIC_WEBAPP_BASE_URL`: the public HTTPS origin of this bot, when the
   platform does not provide `RENDER_EXTERNAL_URL`.
@@ -29,6 +35,16 @@ It never decides whether a user satisfies a gate.
   groups (default `86400`; admins can override it in `/cwconfig`).
 - `VERIFY_SESSION_MAX_ATTEMPTS`: database-enforced submission limit per
   verification link (default `10`).
+- `VERIFY_SESSION_TIMEOUT_SECONDS`: lifetime of a newly issued link (default
+  `900`, or 15 minutes).
+- `VERIFY_PROCESSING_LEASE_SECONDS`: ownership lease for one in-flight
+  signature-and-holdings request (default and minimum `300`; automatically
+  raised if GraphQL deadlines require it).
+- `WAITRESS_THREADS`: HTTP worker threads (default `12`, minimum `8`) so slow
+  bounded GraphQL checks cannot consume all liveness/readiness capacity.
+- `VERIFY_CONCURRENT_REQUESTS`: maximum simultaneous signature-and-holdings
+  checks (default `6`, always at least two below `WAITRESS_THREADS`) to reserve
+  server capacity for health, readiness, Telegram, and retry responses.
 - `METRICS_TOKEN`: optional bearer token that enables the otherwise hidden
   JSON `/metrics` endpoint.
 
@@ -57,6 +73,12 @@ members are not alerted or removed on an indeterminate result.
 Wallet persistence and session completion share one database transaction.
 `user_wallet_addresses` enforces one owner per wallet per group while the
 existing JSON wallet list remains as a compatibility projection.
+
+Completed sessions retain the verified address and pass/fail outcome until
+normal session cleanup. Retrying the same signed submission—or reloading the
+hosted page after an ambiguous network response—returns that durable result
+instead of falsely reporting an expired link. In-flight claims carry a unique
+claim ID, so a stale worker cannot release or finalize a newer worker's claim.
 
 Externally hosted verification links carry their single-use session in the URL
 fragment, so it is not sent to the static host or CDN. The page converts legacy
@@ -91,17 +113,21 @@ page regression test.
 
 ## Deployment order
 
-1. Deploy the Token-Gate backend with `WALLET_CONNECT_URL` temporarily unset.
-2. Verify `/health` and `/ready`; `/ready` must report PostgreSQL and Sui as
+1. Deploy the Alphacity verification page and confirm
+   `https://alphacity.tech/verify/` plus its versioned assets return HTTP 200.
+2. Deploy the Token-Gate backend with the validated Alpha City URL.
+3. Verify `/health` and `/ready`; `/ready` must report PostgreSQL and Sui as
    healthy.
-3. Deploy the Alphacity verification page.
-4. Set `WALLET_CONNECT_URL` and its allowlist/CORS settings.
+4. Confirm an emitted Telegram link starts with
+   `https://alphacity.tech/verify/#` and its fragment names the intended
+   backend `/api/verify` endpoint.
 5. Run a real wallet verification for token, NFT, Kiosk NFT, and any configured
    trait gate.
 
-Rollback is safe: unset `WALLET_CONNECT_URL` to return users to the backend's
-bundled page. The additive session and normalized-wallet schema can remain in
-place.
+The backend's bundled `/verify` page remains available for emergency diagnosis,
+but bot-generated links fail closed to the validated `WALLET_CONNECT_URL`
+instead of silently reverting to the bot domain. The additive session and
+normalized-wallet schema can remain in place during rollback.
 
 ## Monitoring
 

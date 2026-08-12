@@ -501,6 +501,7 @@ class SuiGraphQLGateway:
         author: str,
         message: str,
         signature: str,
+        deadline_monotonic: float | None = None,
     ) -> bool:
         try:
             data = self.execute(
@@ -511,6 +512,7 @@ class SuiGraphQLGateway:
                     "author": author,
                 },
                 operation_name="signature verification",
+                deadline_monotonic=deadline_monotonic,
             )
         except SuiGraphQLError as exc:
             if "BAD_USER_INPUT" in exc.codes:
