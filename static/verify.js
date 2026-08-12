@@ -11,7 +11,6 @@
     'https://token-gate-bot-production.up.railway.app/api/verify';
   const CONTEXT_TIMEOUT_MS = 20000;
   const SUBMISSION_TIMEOUT_MS = 210000;
-  const SUI_MAINNET_CHAIN = 'sui:mainnet';
   const ALLOWED_API_HOSTS = new Set([
     'token-gate-bot-production.up.railway.app',
     'token-gate-bot.onrender.com',
@@ -54,26 +53,20 @@
   }
   const CONTEXT_URL = contextUrl ? contextUrl.toString() : '';
   const telegram = window.Telegram && window.Telegram.WebApp;
-  const registeredWallets = new Set();
-
   let context = null;
-  let selectedWallet = null;
-  let selectedAccount = null;
   let selectedAddress = '';
   let selectedSignature = '';
+  let walletConnector = null;
   let restartUrl = '';
   let telegramReturnUrl = '';
   let contextLoading = false;
   let submissionInFlight = false;
 
   const walletCard = document.getElementById('walletCard');
-  const discoverButton = document.getElementById('discoverButton');
+  const connectWalletButton = document.getElementById('connectWalletButton');
   const signButton = document.getElementById('signButton');
   const submitButton = document.getElementById('submitButton');
   const changeButton = document.getElementById('changeButton');
-  const walletList = document.getElementById('walletList');
-  const accountPanel = document.getElementById('accountPanel');
-  const accountList = document.getElementById('accountList');
   const reviewPanel = document.getElementById('reviewPanel');
   const contextRecovery = document.getElementById('contextRecovery');
 
@@ -149,10 +142,6 @@
     return '0x' + String(address).trim().slice(2).toLowerCase().padStart(64, '0');
   }
 
-  function abbreviatedAddress(address) {
-    return address.slice(0, 8) + '…' + address.slice(-6);
-  }
-
   function ownershipMessage(address) {
     return 'Token Gate wallet ownership verification\n' +
       'Session: ' + VERIFICATION_SESSION + '\n' +
@@ -223,312 +212,66 @@
     });
   }
 
-  function walletAppReadyEvent(api) {
-    return new CustomEvent('wallet-standard:app-ready', { detail: api });
-  }
-
-  function initWalletStandard() {
-    const api = Object.freeze({
-      register(...wallets) {
-        const added = wallets.filter(Boolean);
-        added.forEach(wallet => registeredWallets.add(wallet));
-        return () => added.forEach(wallet => registeredWallets.delete(wallet));
-      }
-    });
-    window.addEventListener('wallet-standard:register-wallet', event => {
-      if (event.detail && typeof event.detail === 'function') {
-        try { event.detail(api); } catch (_) {}
-      }
-    });
-    try { window.dispatchEvent(walletAppReadyEvent(api)); } catch (_) {}
-  }
-
-  function discoverWallets() {
-    const wallets = [];
-    const seen = new Set();
-    const add = wallet => {
-      if (!wallet || seen.has(wallet.name)) return;
-      const chains = wallet.chains || [];
-      if (chains.length && !chains.includes(SUI_MAINNET_CHAIN)) return;
-      seen.add(wallet.name);
-      wallets.push(wallet);
-    };
-    registeredWallets.forEach(add);
-    const registry = window.__wallet_standard__;
-    if (registry) {
-      const direct = typeof registry.get === 'function' ? registry.get() :
-        (registry.wallets && typeof registry.wallets.get === 'function'
-          ? registry.wallets.get()
-          : []);
-      Array.from(direct || []).forEach(add);
-    }
-    [
-      [window.suiWallet, 'Sui Wallet'],
-      [window.slush && (window.slush.sui || window.slush), 'Slush'],
-      [window.suiet, 'Suiet'],
-      [window.nightly, 'Nightly'],
-      [window.martian, 'Martian']
-    ].forEach(([provider, name]) => {
-      if (provider) {
-        add({
-          name,
-          _provider: provider,
-          features: provider.features || {},
-          accounts: provider.accounts || []
-        });
-      }
-    });
-    if (window.phantom && window.phantom.sui) {
-      const provider = window.phantom.sui;
-      add({
-        name: 'Phantom',
-        _provider: provider,
-        features: provider.features || {},
-        accounts: provider.accounts || []
-      });
-    }
-    return wallets;
-  }
-
-  function accountDetails(rawAccount, fallbackName) {
-    const address = typeof rawAccount === 'string'
-      ? rawAccount
-      : rawAccount && rawAccount.address;
-    if (!isValidAddress(address)) return null;
-    const chains = rawAccount && Array.isArray(rawAccount.chains)
-      ? rawAccount.chains
-      : [];
-    if (chains.length && !chains.includes(SUI_MAINNET_CHAIN)) return null;
-    if (rawAccount && rawAccount.chain && rawAccount.chain !== SUI_MAINNET_CHAIN) {
-      return null;
-    }
-    return {
-      raw: rawAccount,
-      address: canonicalAddress(address),
-      label: (rawAccount && rawAccount.label) || fallbackName || 'Sui account'
-    };
-  }
-
-  async function connectWallet(wallet) {
-    const feature = wallet.features && wallet.features['standard:connect'];
-    const connect = feature && typeof feature.connect === 'function'
-      ? feature.connect.bind(feature)
-      : (wallet._provider && typeof wallet._provider.connect === 'function'
-        ? wallet._provider.connect.bind(wallet._provider)
-        : null);
-    if (!connect) throw new Error('This wallet does not expose a supported connect feature.');
-    const result = await connect();
-    let accounts = Array.from((result && result.accounts) || wallet.accounts || []);
-    if (!accounts.length && result && result.publicKey) {
-      const address = typeof result.publicKey.toSuiAddress === 'function'
-        ? result.publicKey.toSuiAddress()
-        : String(result.publicKey);
-      accounts = [{ address }];
-    }
-    if (!accounts.length && wallet._provider &&
-        typeof wallet._provider.getAccounts === 'function') {
-      accounts = Array.from(await wallet._provider.getAccounts() || []);
-    }
-    const normalized = accounts
-      .map(account => accountDetails(account, wallet.name))
-      .filter(Boolean);
-    if (!normalized.length) throw new Error('The wallet did not return a valid Sui account.');
-    if (wallet._provider) wallet._connectedAccountCount = normalized.length;
-    return normalized;
-  }
-
-  async function activateLegacyAccount(wallet, account, address) {
-    const provider = wallet._provider;
-    if (!provider || (wallet._connectedAccountCount || 0) < 2) return;
-    const requestedAddress = typeof account === 'string'
-      ? account
-      : (account && account.address) || address;
-    if (typeof provider.switchAccount === 'function') {
-      await provider.switchAccount(requestedAddress);
-    } else if (typeof provider.selectAccount === 'function') {
-      await provider.selectAccount(requestedAddress);
-    } else if (typeof provider.connect === 'function') {
-      await provider.connect({ account: requestedAddress, onlyIfTrusted: false });
-    } else {
-      throw new Error('Switch to this account inside your wallet, then reconnect.');
-    }
-    const active = (provider.account && provider.account.address) ||
-      provider.selectedAddress || provider.address || '';
-    if (active && (!isValidAddress(active) || canonicalAddress(active) !== address)) {
-      throw new Error('The wallet did not switch to the selected account.');
-    }
-  }
-
-  async function signOwnership(wallet, account, address) {
-    const message = new TextEncoder().encode(ownershipMessage(address));
-    for (const key of [
-      'sui:signPersonalMessage',
-      'sui:signMessage'
-    ]) {
-      const feature = wallet.features && wallet.features[key];
-      const sign = feature && (feature.signPersonalMessage || feature.signMessage);
-      if (typeof sign !== 'function') continue;
-      const input = account ? { message, account } : { message };
-      const result = await sign.call(feature, input);
-      const signature = result && toBase64(result.signature);
-      if (signature) return signature;
-    }
-    await activateLegacyAccount(wallet, account, address);
-    const legacyInput = { message, account, address };
-    if (wallet._provider && typeof wallet._provider.signPersonalMessage === 'function') {
-      const result = await wallet._provider.signPersonalMessage(legacyInput);
-      const signature = result && toBase64(result.signature);
-      if (signature) return signature;
-    }
-    if (wallet._provider && typeof wallet._provider.signMessage === 'function') {
-      const result = await wallet._provider.signMessage(legacyInput);
-      const signature = result && toBase64(result.signature);
-      if (signature) return signature;
-    }
-    throw new Error('This wallet does not support Sui personal-message signing.');
-  }
-
-  function selectAccount(account) {
-    selectedAccount = account.raw;
-    selectedAddress = account.address;
+  function handleWalletChange(session) {
     selectedSignature = '';
-    accountPanel.hidden = true;
-    walletList.hidden = true;
-    reviewPanel.hidden = false;
-    document.getElementById('connectedWallet').textContent =
-      selectedWallet.name || 'Sui Wallet';
-    document.getElementById('connectedAddress').textContent = selectedAddress;
-    document.getElementById('ownershipMessage').textContent =
-      ownershipMessage(selectedAddress);
     document.getElementById('signedStatus').hidden = true;
     signButton.hidden = false;
     signButton.disabled = false;
     submitButton.hidden = true;
     submitButton.disabled = true;
-  }
-
-  function renderAccounts(accounts) {
-    accountList.textContent = '';
-    accountPanel.hidden = false;
-    accounts.forEach(account => {
-      const button = document.createElement('button');
-      button.className = 'account';
-      button.type = 'button';
-      const copy = document.createElement('span');
-      const name = document.createElement('span');
-      name.className = 'account-name';
-      name.textContent = account.label;
-      const address = document.createElement('span');
-      address.className = 'account-address';
-      address.textContent = abbreviatedAddress(account.address);
-      copy.append(name, address);
-      const arrow = document.createElement('span');
-      arrow.textContent = '→';
-      button.append(copy, arrow);
-      button.addEventListener('click', () => selectAccount(account));
-      accountList.appendChild(button);
-    });
-    if (accounts.length === 1) selectAccount(accounts[0]);
-  }
-
-  function renderWallets(wallets) {
-    walletList.textContent = '';
-    walletList.hidden = false;
-    if (!wallets.length) {
-      const inTelegram = isRealTelegramContext();
-      showNotice(
-        'walletNotice',
-        inTelegram
-          ? 'Wallet extensions cannot run in Telegram’s browser. Open this page in your system browser.'
-          : 'No Sui wallet was detected. Install or unlock Slush, Phantom, Suiet, or Nightly, then retry.',
-        'error'
-      );
-      discoverButton.hidden = false;
-      discoverButton.textContent = inTelegram
-        ? 'Open in external browser'
-        : 'Retry wallet detection';
-      discoverButton.disabled = false;
-      discoverButton.dataset.external = inTelegram ? 'true' : 'false';
+    if (!session) {
+      selectedAddress = '';
+      reviewPanel.hidden = true;
       return;
     }
-    discoverButton.hidden = true;
-    wallets.forEach(wallet => {
-      const button = document.createElement('button');
-      button.className = 'wallet';
-      button.type = 'button';
-      const icon = document.createElement('span');
-      icon.className = 'wallet-icon';
-      if (wallet.icon) {
-        const image = document.createElement('img');
-        image.src = typeof wallet.icon === 'string' ? wallet.icon : wallet.icon.src;
-        image.alt = '';
-        icon.appendChild(image);
-      } else {
-        icon.textContent = '👛';
-      }
-      const copy = document.createElement('span');
-      const name = document.createElement('span');
-      name.className = 'wallet-name';
-      name.textContent = wallet.name || 'Sui Wallet';
-      const hint = document.createElement('span');
-      hint.className = 'wallet-hint';
-      hint.textContent = 'Connect';
-      copy.append(name, hint);
-      const arrow = document.createElement('span');
-      arrow.textContent = '→';
-      button.append(icon, copy, arrow);
-      button.addEventListener('click', async () => {
-        clearNotice('walletNotice');
-        Array.from(walletList.querySelectorAll('button')).forEach(item => {
-          item.disabled = true;
-        });
-        hint.textContent = 'Waiting for wallet…';
-        setBusy(true);
-        try {
-          const accounts = await connectWallet(wallet);
-          selectedWallet = wallet;
-          walletList.hidden = true;
-          renderAccounts(accounts);
-          clearNotice('walletNotice');
-          track('wallet_connect', {
-            status: 'success',
-            provider: walletTelemetryProvider(wallet.name)
-          });
-        } catch (error) {
-          hint.textContent = 'Connect';
-          Array.from(walletList.querySelectorAll('button')).forEach(item => {
-            item.disabled = false;
-          });
-          showNotice(
-            'walletNotice',
-            error.message || 'Wallet connection was cancelled.',
-            'error'
-          );
-          track('wallet_connect', {
-            status: 'failure',
-            provider: walletTelemetryProvider(wallet.name)
-          });
-        } finally {
-          setBusy(false);
-        }
-      });
-      walletList.appendChild(button);
+    if (!isValidAddress(session.address)) {
+      selectedAddress = '';
+      reviewPanel.hidden = true;
+      showNotice('walletNotice', 'The wallet returned an invalid Sui address.', 'error');
+      return;
+    }
+    selectedAddress = canonicalAddress(session.address);
+    reviewPanel.hidden = false;
+    document.getElementById('connectedWallet').textContent =
+      session.walletName || 'Sui Wallet';
+    document.getElementById('connectedAddress').textContent = selectedAddress;
+    document.getElementById('ownershipMessage').textContent =
+      ownershipMessage(selectedAddress);
+    clearNotice('walletNotice');
+  }
+
+  function initWalletConnector() {
+    if (walletConnector) return;
+    if (!window.AlphaCityWalletConnector ||
+        typeof window.AlphaCityWalletConnector.create !== 'function') {
+      throw new Error('The Alpha City wallet connector could not be loaded. Please refresh.');
+    }
+    walletConnector = window.AlphaCityWalletConnector.create({
+      button: connectWalletButton,
+      autoReconnect: false,
+      persistSession: false,
+      alwaysPrompt: true,
+      requirePersonalMessage: true,
+      connectLabel: 'Choose Wallet',
+      onChange: handleWalletChange
     });
+  }
+
+  async function signOwnership() {
+    if (!walletConnector || !selectedAddress) {
+      throw new Error('Choose the wallet and account you want to register first.');
+    }
+    const message = new TextEncoder().encode(ownershipMessage(selectedAddress));
+    const result = await walletConnector.signPersonalMessage(message);
+    const signature = toBase64(result && result.signature ? result.signature : result);
+    if (!signature) throw new Error('The wallet returned an invalid signature.');
+    return signature;
   }
 
   function setRecoveryButtons() {
     const hasRestart = Boolean(restartUrl);
     document.getElementById('newLinkButton').hidden = !hasRestart;
     document.getElementById('resultNewLinkButton').hidden = !hasRestart;
-  }
-
-  function walletTelemetryProvider(name) {
-    const normalized = String(name || '').toLowerCase();
-    for (const provider of ['slush', 'phantom', 'suiet', 'nightly', 'martian']) {
-      if (normalized.includes(provider)) return provider;
-    }
-    if (normalized.includes('sui wallet')) return 'sui_wallet';
-    return 'other';
   }
 
   async function fetchJsonWithTimeout(url, options, timeoutMs) {
@@ -581,8 +324,7 @@
       }
       context = result;
       renderRequirements();
-      discoverButton.disabled = false;
-      discoverButton.textContent = 'Find Sui wallets';
+      initWalletConnector();
     } finally {
       contextLoading = false;
       document.getElementById('contextRetryButton').disabled = false;
@@ -716,31 +458,12 @@
     if (restartUrl) window.location.assign(restartUrl);
   }
 
-  discoverButton.addEventListener('click', () => {
-    clearNotice('walletNotice');
-    if (discoverButton.dataset.external === 'true') {
-      if (isRealTelegramContext() && telegram && typeof telegram.openLink === 'function') {
-        telegram.openLink(window.location.href);
-      } else {
-        window.open(window.location.href, '_blank', 'noopener');
-      }
-      return;
-    }
-    discoverButton.disabled = true;
-    discoverButton.textContent = 'Detecting wallets…';
-    window.setTimeout(() => renderWallets(discoverWallets()), 300);
-  });
-
   signButton.addEventListener('click', async () => {
     clearNotice('walletNotice');
     signButton.disabled = true;
     setBusy(true, 'Waiting for your wallet signature…');
     try {
-      selectedSignature = await signOwnership(
-        selectedWallet,
-        selectedAccount,
-        selectedAddress
-      );
+      selectedSignature = await signOwnership();
       document.getElementById('signedStatus').hidden = false;
       signButton.hidden = true;
       submitButton.hidden = false;
@@ -762,19 +485,16 @@
 
   changeButton.addEventListener('click', async () => {
     try {
-      const disconnect = selectedWallet && selectedWallet.features &&
-        selectedWallet.features['standard:disconnect'];
-      if (disconnect && typeof disconnect.disconnect === 'function') {
-        await disconnect.disconnect.call(disconnect);
-      }
-    } catch (_) {}
-    selectedWallet = null;
-    selectedAccount = null;
-    selectedAddress = '';
-    selectedSignature = '';
-    reviewPanel.hidden = true;
-    accountPanel.hidden = true;
-    renderWallets(discoverWallets());
+      clearNotice('walletNotice');
+      if (!walletConnector) throw new Error('The wallet connector is not ready.');
+      await walletConnector.walletOptions();
+    } catch (error) {
+      showNotice(
+        'walletNotice',
+        error.message || 'Wallet options could not be opened.',
+        'error'
+      );
+    }
   });
 
   document.getElementById('copyMessageButton').addEventListener('click', async () => {
@@ -803,12 +523,11 @@
 
   function handleContextError(error) {
     walletCard.setAttribute('aria-busy', 'false');
-    discoverButton.textContent = 'Verification unavailable';
-    discoverButton.disabled = true;
+    connectWalletButton.textContent = 'Verification unavailable';
+    connectWalletButton.disabled = true;
     contextRecovery.hidden = false;
     showNotice('walletNotice', error.message, 'error');
   }
 
-  initWalletStandard();
   loadContext().catch(handleContextError);
 })();

@@ -1,62 +1,81 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-wallet-connector-styles="external">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="referrer" content="no-referrer">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://telegram.org; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; img-src 'self' data: https:; style-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>CityWatch Wallet Verification</title>
-  <link rel="stylesheet" href="/static/verify.css?v=20260812-1">
+  <title>Wallet Verification | Alpha City</title>
+  <link rel="stylesheet" href="/static/verify.css?v=20260812-2">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script defer src="/static/verify.js?v=20260812-1"></script>
+  <script defer src="/static/wallet-connector.js?v=20260812-2"></script>
+  <script defer src="/static/verify.js?v=20260812-2"></script>
 </head>
 <body
   data-api-verify-url="{{ api_verify_url|e }}"
   data-verification-session="{{ verification_session|e }}"
 >
-<main>
-  <header>
-    <div class="brand" aria-hidden="true">🏙️</div>
+<header class="site-header">
+  <nav class="site-nav" aria-label="Alpha City">
+    <a class="site-brand" href="https://alphacity.tech/">
+      <span>Alpha <strong>City</strong></span>
+      <span class="network-badge">Mainnet Live</span>
+    </a>
+    <a class="back-link" href="https://alphacity.tech/">Back to Alpha City</a>
+  </nav>
+</header>
+
+<main class="page-shell">
+  <header class="page-intro">
+    <div class="eyebrow">Secure wallet verification</div>
     <h1>Verify your Sui wallet</h1>
-    <div class="subtitle">Review and sign an ownership message. No transaction or funds are requested.</div>
+    <p class="subtitle">Connect with the same Alpha City wallet picker, review the ownership message, and register without approving a transaction.</p>
   </header>
 
   <div class="steps" aria-label="Verification progress">
-    <div class="step active" id="step1" aria-label="Connect">1</div><div class="step-line" id="line1"></div>
-    <div class="step" id="step2" aria-label="Verify">2</div><div class="step-line" id="line2"></div>
-    <div class="step" id="step3" aria-label="Result">3</div>
+    <div class="step active" id="step1" aria-label="Connect"><span>1</span><small>Connect</small></div>
+    <div class="step-line" id="line1"></div>
+    <div class="step" id="step2" aria-label="Verify"><span>2</span><small>Verify</small></div>
+    <div class="step-line" id="line2"></div>
+    <div class="step" id="step3" aria-label="Result"><span>3</span><small>Result</small></div>
   </div>
 
   <section class="section active" id="section1">
     <div class="card" id="walletCard" aria-busy="true">
-      <h2>1. Connect your wallet</h2>
-      <p>Choose a wallet, select the account you want to register, then review the exact ownership message before signing.</p>
+      <div class="card-heading">
+        <span class="card-kicker">Step 1</span>
+        <h2>Choose the wallet to register</h2>
+        <p>The Alpha City wallet picker lets you select a provider and account explicitly. Verification never reconnects a saved wallet automatically.</p>
+      </div>
+
       <div class="requirements" id="requirements"></div>
 
-      <button id="discoverButton" disabled>Loading verification link…</button>
-      <div class="wallet-list" id="walletList"></div>
-
-      <div id="accountPanel" hidden>
-        <h3>Select an account</h3>
-        <p>Only the selected address will be registered.</p>
-        <div class="account-list" id="accountList"></div>
-      </div>
+      <button class="wallet-connect-button" id="connectWalletButton" type="button" disabled>
+        Loading verification link…
+      </button>
+      <p class="wallet-helper">You can switch the wallet provider or account before signing.</p>
 
       <div id="reviewPanel" hidden>
         <div class="connected">
-          <strong id="connectedWallet"></strong>
-          <span id="connectedAddress"></span>
+          <span class="connected-dot" aria-hidden="true"></span>
+          <div>
+            <strong id="connectedWallet"></strong>
+            <span id="connectedAddress"></span>
+          </div>
         </div>
-        <h3>2. Review and sign</h3>
-        <p>Your wallet should show this exact message. Signing proves address ownership and cannot move assets.</p>
+        <div class="review-heading">
+          <span class="card-kicker">Step 2</span>
+          <h3>Review and sign</h3>
+          <p>Your wallet should show this exact message. Signing proves address ownership and cannot move assets.</p>
+        </div>
         <div class="message-review">
           <pre id="ownershipMessage"></pre>
           <button class="compact secondary" id="copyMessageButton" type="button">Copy message</button>
         </div>
         <button id="signButton" type="button">Sign ownership message</button>
         <div class="signed-status" id="signedStatus" hidden>✓ Ownership message signed</div>
-        <button id="submitButton" type="button" hidden disabled>3. Submit verification</button>
-        <button class="secondary" id="changeButton" type="button">Choose another wallet</button>
+        <button id="submitButton" type="button" hidden disabled>Submit verification</button>
+        <button class="secondary" id="changeButton" type="button">Switch wallet or account</button>
       </div>
 
       <div class="notice" id="walletNotice" role="status" aria-live="polite"></div>
@@ -71,6 +90,7 @@
   <section class="section" id="section2">
     <div class="card center" aria-live="polite">
       <div class="spinner" aria-hidden="true"></div>
+      <span class="card-kicker">Server verification</span>
       <h2>Checking your holdings</h2>
       <p>The server is validating your signature, token balance, NFTs, and Kiosk items.</p>
     </div>
@@ -90,7 +110,12 @@
     </div>
   </section>
 
-  <div class="fine-print">CityWatch never asks for a seed phrase or private key.</div>
+  <div class="trust-note">
+    <span aria-hidden="true">◆</span>
+    CityWatch never asks for a seed phrase or private key.
+  </div>
 </main>
+
+<footer class="site-footer">© 2024 Alpha City. All rights reserved.</footer>
 </body>
 </html>
