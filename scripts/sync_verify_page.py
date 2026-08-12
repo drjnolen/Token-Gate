@@ -56,18 +56,28 @@ test('verification page uses session context and a minimal signed payload', () =
   assert.match(app, /Wallet: ' \+ canonicalAddress\(address\)/);
 });
 
-test('shared wallet choice, message review, sign, and submit are separate stages', () => {
+test('signing automatically starts server verification after explicit review', () => {
   assert.match(html, /id="connectWalletButton"/);
   assert.match(html, /id="ownershipMessage"/);
   assert.match(html, /id="signButton"/);
-  assert.match(html, /id="submitButton"/);
+  assert.doesNotMatch(html, /id="submitButton"/);
+  assert.match(
+    html,
+    /Confirm wallet and holdings via non-transactional signature\. Zero risk to your holdings/,
+  );
   assert.match(app, /AlphaCityWalletConnector\.create/);
   assert.match(app, /alwaysPrompt:\s*true/);
   assert.match(app, /autoReconnect:\s*false/);
   assert.match(app, /persistSession:\s*false/);
   assert.match(app, /requirePersonalMessage:\s*true/);
+  assert.match(app, /selectedSignature = await signOwnership\(\)/);
+  assert.match(app, /await submitVerification\(\)/);
   assert.ok(
     app.indexOf('initWalletConnector()') < app.indexOf("signButton.addEventListener"),
+  );
+  assert.ok(
+    app.indexOf('selectedSignature = await signOwnership()') <
+      app.indexOf('await submitVerification()'),
   );
 });
 

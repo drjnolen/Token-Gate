@@ -39,6 +39,10 @@ from verification_config import (
     normalize_public_api_base_url,
     normalize_wallet_connect_url,
 )
+from verification_results import (
+    qualifying_holdings_summary,
+    verification_success_message,
+)
 from runtime_support import (
     DelayedTaskScheduler,
     RuntimeMetrics,
@@ -646,7 +650,8 @@ def init_db():
                 last_attempt_at TIMESTAMP DEFAULT NULL,
                 claim_id TEXT DEFAULT NULL,
                 wallet_address TEXT DEFAULT NULL,
-                eligibility_status TEXT DEFAULT NULL
+                eligibility_status TEXT DEFAULT NULL,
+                holdings_summary JSONB DEFAULT NULL
             )
         """)
         cur.execute("""
@@ -765,6 +770,10 @@ def init_db():
             cur.execute(
                 "ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS "
                 "eligibility_status TEXT DEFAULT NULL"
+            )
+            cur.execute(
+                "ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS "
+                "holdings_summary JSONB DEFAULT NULL"
             )
             cur.execute(
                 "ALTER TABLE poll_votes ADD COLUMN IF NOT EXISTS "
@@ -1516,7 +1525,8 @@ def get_completed_verification_result(session_id, wallet_address=None):
     with get_db_cursor() as (conn, cur):
         cur.execute(
             """
-            SELECT group_id, user_id, wallet_address, eligibility_status
+            SELECT group_id, user_id, wallet_address, eligibility_status,
+                   holdings_summary
             FROM verification_sessions
             WHERE session_id = %s
               AND status = 'completed'
@@ -1535,6 +1545,7 @@ def get_completed_verification_result(session_id, wallet_address=None):
         "user_id": row[1],
         "wallet_address": row[2],
         "eligibility_status": row[3] or "unknown",
+        "holdings_summary": row[4] or {},
     }
 
 
@@ -1643,6 +1654,7 @@ def finalize_verified_wallet(
     wallet_address,
     registration_type,
     eligibility_status,
+    holdings_summary,
     claim_id,
 ):
     """Atomically save a verified wallet and complete its claimed session."""
@@ -1715,10 +1727,16 @@ def finalize_verified_wallet(
                 processing_at = NULL,
                 claim_id = NULL,
                 wallet_address = %s,
-                eligibility_status = %s
+                eligibility_status = %s,
+                holdings_summary = %s::jsonb
             WHERE session_id = %s
             """,
-            (wallet_address, eligibility_status, session_id),
+            (
+                wallet_address,
+                eligibility_status,
+                json.dumps(holdings_summary or {}),
+                session_id,
+            ),
         )
         return cur.rowcount == 1
 
@@ -6120,6 +6138,7 @@ def _send_group_verified_notification(group_id, display_name):
 def _completed_verification_payload(completed, restart_url):
     """Build the stable response returned by completed-session replays."""
     eligibility_status = completed.get("eligibility_status") or "unknown"
+    holdings_summary = completed.get("holdings_summary") or {}
     if eligibility_status == "fail":
         return ({
             'success': False,
@@ -6139,11 +6158,12 @@ def _completed_verification_payload(completed, restart_url):
     if eligibility_status == "pass":
         return ({
             'success': True,
-            'message': 'Wallet verified and registered successfully',
+            'message': verification_success_message(holdings_summary),
             'ownership_verified': True,
             'wallet_registered': True,
             'eligibility_status': 'pass',
             'requirements_met': True,
+            'qualifying_holdings': holdings_summary,
             'restart_url': restart_url,
             'replayed': True,
         }, 200)
@@ -6535,6 +6555,7 @@ def api_verify():
                 'restart_url': restart_url,
             })), 503
 
+        holdings_summary = qualifying_holdings_summary(cfg, requirement_eval)
         username = _get_user_display_name(tg_user_id)
         try:
             success = finalize_verified_wallet(
@@ -6545,6 +6566,7 @@ def api_verify():
                 wallet_address,
                 cfg.get("registration_mode", "token"),
                 'pass' if requirement_eval['requirements_met'] else 'fail',
+                holdings_summary,
                 claim_id,
             )
         except psycopg2.IntegrityError:
@@ -6617,11 +6639,12 @@ def api_verify():
         runtime_metrics.increment("verification_succeeded")
         return _add_cors_headers(jsonify({
             'success': True,
-            'message': 'Wallet verified and registered successfully',
+            'message': verification_success_message(holdings_summary),
             'ownership_verified': True,
             'wallet_registered': True,
             'eligibility_status': 'pass',
             'requirements_met': True,
+            'qualifying_holdings': holdings_summary,
             'restart_url': restart_url,
         }))
 
