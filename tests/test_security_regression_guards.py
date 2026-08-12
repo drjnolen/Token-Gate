@@ -33,18 +33,24 @@ class EnforcementRegressionGuards(unittest.TestCase):
     def test_sessions_are_retryable_and_wallet_completion_is_atomic(self):
         claim = FUNCTIONS["claim_verification_session"]
         self.assertIn("status = 'processing'", claim)
-        self.assertIn("INTERVAL '2 minutes'", claim)
+        self.assertIn("claim_id = %s", claim)
+        self.assertIn("VERIFICATION_PROCESSING_LEASE_SECONDS", claim)
         finalize = FUNCTIONS["finalize_verified_wallet"]
         self.assertIn("_save_wallet_for_user_with_cursor", finalize)
         self.assertIn("status = 'completed'", finalize)
         self.assertIn("FOR UPDATE", finalize)
-        attempts = FUNCTIONS["consume_verification_attempt"]
-        self.assertIn("attempt_count = attempt_count + 1", attempts)
-        self.assertIn("attempt_count < %s", attempts)
-        self.assertIn(
-            "consume_verification_attempt(verification_session)",
-            FUNCTIONS["api_verify"],
-        )
+        self.assertIn("AND claim_id = %s", finalize)
+        self.assertIn("DELETE FROM pending_verifications", finalize)
+        self.assertNotIn("expires_at > NOW()", finalize)
+        release = FUNCTIONS["release_verification_session"]
+        self.assertIn("AND claim_id = %s", release)
+        self.assertIn("attempt_count = attempt_count + CASE", claim)
+        self.assertIn("attempt_count < %s", claim)
+        self.assertIn("status = 'processing' AND claim_id = %s", claim)
+        self.assertIn("WHEN claim_id = %s THEN 0 ELSE 1", claim)
+        self.assertNotIn("@db_retry", claim)
+        self.assertNotIn("@db_retry", finalize)
+        self.assertNotIn("@db_retry", release)
 
     def test_runtime_and_browser_have_no_json_rpc_transport(self):
         runtime = Path("main.py").read_text(encoding="utf-8")
@@ -84,14 +90,40 @@ class EnforcementRegressionGuards(unittest.TestCase):
         sign_index = browser.index("signButton.addEventListener")
         self.assertLess(connect_index, sign_index)
         self.assertIn("Wallet registered — requirements not met", browser)
+        self.assertIn("verification_completed", browser)
+        self.assertIn("submissionInFlight", browser)
+        self.assertIn("fetchJsonWithTimeout", browser)
+        self.assertIn("new CustomEvent('wallet-standard:app-ready'", browser)
+        self.assertIn("'sui:signMessage'", browser)
+        self.assertNotIn("'standard:signMessage'", browser)
+        self.assertIn("activateLegacyAccount", browser)
+        self.assertIn("window.slush.sui || window.slush", browser)
+
+    def test_signature_and_holdings_share_one_bounded_deadline(self):
+        endpoint = FUNCTIONS["api_verify"]
+        gateway = Path("sui_gateway.py").read_text(encoding="utf-8")
+        self.assertIn("operation_deadline = time.monotonic()", endpoint)
+        self.assertIn("deadline_monotonic=operation_deadline", endpoint)
+        self.assertIn("deadline_monotonic: float | None = None", gateway)
+        self.assertIn("WAITRESS_THREADS", Path("main.py").read_text(encoding="utf-8"))
+        self.assertIn("_verification_work_slots.acquire", endpoint)
+        self.assertIn("_verification_work_slots.release", endpoint)
+
+    def test_readiness_covers_public_wallet_registration_configuration(self):
+        readiness = FUNCTIONS["readiness_check"]
+        self.assertIn("wallet_registration", readiness)
+        self.assertIn("get_public_api_base_url()", readiness)
+        self.assertIn("wallet_connect_url", readiness)
 
     def test_verification_page_uses_fragment_tokens_and_external_assets(self):
         runtime = Path("main.py").read_text(encoding="utf-8")
         template = Path("templates/verify.html").read_text(encoding="utf-8")
         browser = Path("static/verify.js").read_text(encoding="utf-8")
         styles = Path("static/verify.css").read_text(encoding="utf-8")
-        self.assertIn("base_url != local_base_url", FUNCTIONS["build_wallet_connect_url"])
-        self.assertIn("else '#'", FUNCTIONS["build_wallet_connect_url"])
+        runtime_config = Path("verification_config.py").read_text(encoding="utf-8")
+        self.assertIn("https://alphacity.tech/verify/", runtime_config)
+        self.assertIn("build_hosted_verification_url", FUNCTIONS["build_wallet_connect_url"])
+        self.assertNotIn("FALLBACK_VERIFY_URL", runtime)
         self.assertIn("window.location.hash", browser)
         self.assertIn("window.history.replaceState", browser)
         self.assertIn('/static/verify.css', template)
@@ -100,6 +132,26 @@ class EnforcementRegressionGuards(unittest.TestCase):
         self.assertNotIn("'unsafe-inline'", template)
         self.assertNotIn("'unsafe-inline'", runtime)
         self.assertIn("[hidden] { display: none !important; }", styles)
+
+    def test_completed_verification_is_replayable_and_post_commit_work_is_safe(self):
+        endpoint = FUNCTIONS["api_verify"]
+        self.assertIn("get_completed_verification_result", endpoint)
+        self.assertIn("verification_result_replays", endpoint)
+        self.assertIn("finally:", endpoint)
+        finalize = FUNCTIONS["finalize_verified_wallet"]
+        self.assertIn("eligibility_status = %s", finalize)
+        self.assertIn("wallet_address = %s", finalize)
+        self.assertIn("DELETE FROM pending_verifications", finalize)
+        # Pending-context cleanup must be part of the same transaction that
+        # completes the session, never an uncaught post-commit operation.
+        self.assertNotIn("DELETE FROM pending_verifications", endpoint)
+
+    def test_first_wallet_insert_is_locked_before_merging_addresses(self):
+        source = FUNCTIONS["_save_wallet_for_user_with_cursor"]
+        insert_index = source.index("INSERT INTO user_wallets")
+        lock_index = source.index("SELECT wallets")
+        self.assertLess(insert_index, lock_index)
+        self.assertIn("ON CONFLICT (group_id, user_id) DO NOTHING", source)
 
     def test_admission_checks_are_tri_state(self):
         source = FUNCTIONS["evaluate_wallet_requirements"]

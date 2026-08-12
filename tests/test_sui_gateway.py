@@ -211,6 +211,18 @@ class SuiGraphQLGatewayTests(unittest.TestCase):
         self.assertEqual(session.calls, [])
         self.assertEqual(gateway.provider_status()[0]["failures"], 0)
 
+    def test_signature_verification_honors_operation_deadline(self):
+        session = FakeSession()
+        gateway = self.gateway(session)
+        with self.assertRaisesRegex(SuiGatewayError, "deadline"):
+            gateway.verify_personal_message(
+                author="0x1",
+                message="message",
+                signature="signature",
+                deadline_monotonic=time.monotonic() - 1,
+            )
+        self.assertEqual(session.calls, [])
+
     def test_owned_object_item_budget_prevents_unbounded_collection(self):
         session = FakeSession()
         session.queue(

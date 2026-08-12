@@ -23,6 +23,8 @@ const test = require('node:test');
 const html = fs.readFileSync('verify/index.html', 'utf8');
 const app = fs.readFileSync('verify/app.js', 'utf8');
 const css = fs.readFileSync('verify/styles.css', 'utf8');
+const ciWorkflow = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
+const deployWorkflow = fs.readFileSync('.github/workflows/deploy.yml', 'utf8');
 const source = html + '\n' + app;
 
 test('verification page contains no legacy Sui RPC client or browser authority', () => {
@@ -77,6 +79,51 @@ test('verification page has recovery and registered-but-ineligible states', () =
   assert.match(app, /Wallet registered — requirements not met/);
   assert.match(app, /result\.wallet_registered/);
   assert.match(app, /result\.eligibility_status === 'fail'/);
+  assert.match(app, /verification_completed/);
+  assert.match(app, /Result not confirmed/);
+});
+
+test('verification service routing fails closed and requests are bounded', () => {
+  assert.match(app, /apiConfigurationError/);
+  assert.match(app, /untrusted verification API URL/);
+  assert.doesNotMatch(app, /apiHostAllowed \? requestedApiUrl : new URL\(DEFAULT_API_VERIFY_URL\)/);
+  assert.match(app, /CONTEXT_TIMEOUT_MS/);
+  assert.match(app, /SUBMISSION_TIMEOUT_MS/);
+  assert.match(app, /fetchJsonWithTimeout/);
+  assert.match(app, /submissionInFlight/);
+});
+
+test('wallet discovery supports modern and legacy Sui mainnet wallets', () => {
+  assert.match(app, /new CustomEvent\('wallet-standard:app-ready'/);
+  assert.match(app, /return \(\) => added\.forEach/);
+  assert.match(app, /sui:mainnet/);
+  assert.match(app, /window\.slush\.sui \|\| window\.slush/);
+  assert.match(app, /sui:signPersonalMessage/);
+  assert.match(app, /sui:signMessage/);
+  assert.doesNotMatch(app, /standard:signMessage/);
+  assert.match(app, /activateLegacyAccount/);
+});
+
+test('verification telemetry contains no wallet or session identifiers', () => {
+  assert.match(app, /track\('wallet_connect'/);
+  assert.match(app, /track\('transaction_sign'/);
+  assert.match(app, /track\('gate_check'/);
+  assert.match(app, /walletTelemetryProvider/);
+  const trackCalls = [...app.matchAll(/track\([^;]+\);/g)].map(match => match[0]).join('\n');
+  assert.doesNotMatch(trackCalls, /address|signature|session|balance|telegram/i);
+  assert.doesNotMatch(trackCalls, /provider:\s*wallet\.name/);
+});
+
+test('verification regressions gate pull requests and production deployment', () => {
+  assert.match(ciWorkflow, /pull_request:/);
+  assert.match(ciWorkflow, /npm test/);
+  assert.match(ciWorkflow, /npm audit --audit-level=high/);
+  assert.match(deployWorkflow, /npm test/);
+  assert.match(deployWorkflow, /npm audit --audit-level=high/);
+  assert.ok(
+    deployWorkflow.indexOf('npm test') <
+      deployWorkflow.indexOf('actions\/upload-pages-artifact'),
+  );
 });
 
 test('verification page uses external assets without inline execution or styles', () => {

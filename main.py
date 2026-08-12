@@ -17,7 +17,7 @@ from psycopg2 import pool
 from logging.handlers import RotatingFileHandler
 from contextlib import contextmanager
 from io import StringIO, BytesIO
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit
 import csv
 import functools
 import datetime
@@ -30,6 +30,14 @@ from waitress import serve as waitress_serve
 from verification_security import (
     build_wallet_ownership_message,
     canonical_sui_address,
+    is_valid_verification_session_id,
+)
+from verification_config import (
+    DEFAULT_PUBLIC_API_BASE_URL,
+    DEFAULT_WALLET_CONNECT_URL,
+    build_hosted_verification_url,
+    normalize_public_api_base_url,
+    normalize_wallet_connect_url,
 )
 from runtime_support import (
     DelayedTaskScheduler,
@@ -121,7 +129,6 @@ SUI_GRAPHQL_URLS = [
     ).split(',')
     if value.strip()
 ]
-WALLET_CONNECT_URL = os.getenv('WALLET_CONNECT_URL', '').strip()
 WALLET_CONNECT_ALLOWED_HOSTS = {
     value.strip().lower()
     for value in os.getenv(
@@ -130,8 +137,20 @@ WALLET_CONNECT_ALLOWED_HOSTS = {
     ).split(',')
     if value.strip()
 }
+try:
+    WALLET_CONNECT_URL = normalize_wallet_connect_url(
+        os.getenv('WALLET_CONNECT_URL', '').strip() or DEFAULT_WALLET_CONNECT_URL,
+        WALLET_CONNECT_ALLOWED_HOSTS,
+    )
+except ValueError as exc:
+    raise ValueError(f"Invalid wallet verification page configuration: {exc}") from exc
 PUBLIC_WEBAPP_BASE_URL = os.getenv('PUBLIC_WEBAPP_BASE_URL', '').strip()
-FALLBACK_VERIFY_URL = 'https://token-gate-bot-production.up.railway.app/verify'
+PUBLIC_API_BASE_URL = os.getenv('PUBLIC_API_BASE_URL', '').strip()
+if PUBLIC_API_BASE_URL:
+    try:
+        PUBLIC_API_BASE_URL = normalize_public_api_base_url(PUBLIC_API_BASE_URL)
+    except ValueError as exc:
+        raise ValueError(f"Invalid public verification API configuration: {exc}") from exc
 CORS_ALLOWED_ORIGINS = {
     value.strip().rstrip('/')
     for value in os.getenv(
@@ -185,13 +204,35 @@ INACTIVE_MEMBER_STATUS_MESSAGES = {
     "kicked": "❌ That user was removed from this group."
 }
 
-# Verification sessions are server-stored, random, and single-use.  This is
-# deliberately short: a wallet-signature request should be completed while
-# the user is actively looking at the verification page.
-VERIFICATION_SESSION_TIMEOUT = 600  # 10 minutes
+# Verification sessions are server-stored, random, and single-use. Give users
+# enough time to switch from Telegram to a system browser and unlock a wallet,
+# while keeping abandoned links short-lived.
+VERIFICATION_SESSION_TIMEOUT = max(
+    300,
+    int(os.getenv("VERIFY_SESSION_TIMEOUT_SECONDS", "900")),
+)
 VERIFICATION_SESSION_MAX_ATTEMPTS = max(
     1,
     int(os.getenv("VERIFY_SESSION_MAX_ATTEMPTS", "10")),
+)
+# A request claims its session while GraphQL verifies the signature and live
+# holdings. The lease must exceed both bounded operations so an older worker
+# can never finalize a claim that a newer worker recovered.
+VERIFICATION_PROCESSING_LEASE_SECONDS = max(
+    300,
+    (2 * SUI_OPERATION_TIMEOUT_SECONDS) + 60,
+    int(os.getenv("VERIFY_PROCESSING_LEASE_SECONDS", "300")),
+)
+WAITRESS_THREADS = max(8, int(os.getenv("WAITRESS_THREADS", "12")))
+VERIFICATION_CONCURRENT_REQUESTS = max(
+    1,
+    min(
+        WAITRESS_THREADS - 2,
+        int(os.getenv("VERIFY_CONCURRENT_REQUESTS", "6")),
+    ),
+)
+_verification_work_slots = threading.BoundedSemaphore(
+    VERIFICATION_CONCURRENT_REQUESTS
 )
 
 
@@ -330,6 +371,21 @@ def get_public_webapp_base_url():
         return f"https://{railway_public_domain}"
 
     return ''
+
+
+def get_public_api_base_url():
+    """Return the validated public origin used by the hosted verifier."""
+    candidate = (
+        PUBLIC_API_BASE_URL
+        or get_public_webapp_base_url()
+        or DEFAULT_PUBLIC_API_BASE_URL
+    )
+    try:
+        return normalize_public_api_base_url(candidate)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Public verification API URL is not configured safely: {exc}"
+        ) from exc
 
 def db_retry(func):
     """Decorator to handle database connection errors and retry."""
@@ -587,7 +643,10 @@ def init_db():
                 processing_at TIMESTAMP DEFAULT NULL,
                 completed_at TIMESTAMP DEFAULT NULL,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
-                last_attempt_at TIMESTAMP DEFAULT NULL
+                last_attempt_at TIMESTAMP DEFAULT NULL,
+                claim_id TEXT DEFAULT NULL,
+                wallet_address TEXT DEFAULT NULL,
+                eligibility_status TEXT DEFAULT NULL
             )
         """)
         cur.execute("""
@@ -694,6 +753,18 @@ def init_db():
             cur.execute(
                 "ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS "
                 "last_attempt_at TIMESTAMP DEFAULT NULL"
+            )
+            cur.execute(
+                "ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS "
+                "claim_id TEXT DEFAULT NULL"
+            )
+            cur.execute(
+                "ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS "
+                "wallet_address TEXT DEFAULT NULL"
+            )
+            cur.execute(
+                "ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS "
+                "eligibility_status TEXT DEFAULT NULL"
             )
             cur.execute(
                 "ALTER TABLE poll_votes ADD COLUMN IF NOT EXISTS "
@@ -933,6 +1004,18 @@ def _save_wallet_for_user_with_cursor(
     existing_wallets = []
     existing_exempt = False
 
+    # Materialize the row before locking it. SELECT ... FOR UPDATE cannot lock
+    # a row that does not exist, which allowed two first-time registrations for
+    # the same user to race and overwrite one another's wallet list.
+    cur.execute(
+        """
+        INSERT INTO user_wallets
+            (group_id, user_id, username, wallets, is_exempt, registration_type)
+        VALUES (%s, %s, %s, %s, FALSE, %s)
+        ON CONFLICT (group_id, user_id) DO NOTHING
+        """,
+        (group_id, user_id, username, json.dumps([]), registration_type),
+    )
     cur.execute(
         """
         SELECT wallets, is_exempt
@@ -964,7 +1047,7 @@ def _save_wallet_for_user_with_cursor(
     if existing_wallets and not replace_existing:
         for wallet in existing_wallets:
             try:
-                    normalized_existing.append(require_canonical_sui_address(wallet))
+                normalized_existing.append(require_canonical_sui_address(wallet))
             except ValueError:
                 logging.warning(
                     "Ignoring invalid stored wallet for group=%s user=%s",
@@ -1355,11 +1438,21 @@ nft_cache = {}
 last_registration_prompt = {}
 
 
-@db_retry
-def create_verification_session(group_id, user_id):
+def create_verification_session(group_id, user_id, *, update_pending_context=False):
     """Create an expiring verification session."""
     session_id = secrets.token_urlsafe(32)
     with get_db_cursor() as (conn, cur):
+        if update_pending_context:
+            cur.execute(
+                """
+                INSERT INTO pending_verifications (user_id, group_id, created_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    group_id = EXCLUDED.group_id,
+                    created_at = EXCLUDED.created_at
+                """,
+                (user_id, group_id),
+            )
         cur.execute(
             """
             INSERT INTO verification_sessions (session_id, group_id, user_id, expires_at)
@@ -1413,36 +1506,55 @@ def get_verification_session_group(session_id):
 
 
 @db_retry
-def consume_verification_attempt(session_id):
-    """Atomically enforce a session-wide attempt limit across all workers."""
+def get_completed_verification_result(session_id, wallet_address=None):
+    """Return the durable result for a completed session, if available."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    canonical_wallet = None
+    if wallet_address:
+        canonical_wallet = require_canonical_sui_address(wallet_address)
     with get_db_cursor() as (conn, cur):
         cur.execute(
             """
-            UPDATE verification_sessions
-            SET attempt_count = attempt_count + 1,
-                last_attempt_at = NOW()
+            SELECT group_id, user_id, wallet_address, eligibility_status
+            FROM verification_sessions
             WHERE session_id = %s
-              AND status IN ('pending', 'processing')
-              AND completed_at IS NULL
-              AND consumed_at IS NULL
-              AND expires_at > NOW()
-              AND attempt_count < %s
-            RETURNING attempt_count
+              AND status = 'completed'
+              AND completed_at IS NOT NULL
+              AND consumed_at IS NOT NULL
             """,
-            (session_id, VERIFICATION_SESSION_MAX_ATTEMPTS),
+            (session_id,),
         )
         row = cur.fetchone()
-        return row[0] if row else None
+    if row is None:
+        return None
+    if canonical_wallet and row[2] != canonical_wallet:
+        return None
+    return {
+        "group_id": row[0],
+        "user_id": row[1],
+        "wallet_address": row[2],
+        "eligibility_status": row[3] or "unknown",
+    }
 
 
-@db_retry
-def claim_verification_session(session_id, group_id, user_id):
-    """Claim a pending session, recovering abandoned claims after two minutes."""
+def claim_verification_session(session_id, group_id, user_id, claim_id):
+    """Claim a session and consume exactly one attempt in the same transaction."""
     with get_db_cursor() as (conn, cur):
         cur.execute(
             """
             UPDATE verification_sessions
-            SET status = 'processing', processing_at = NOW()
+            SET status = 'processing',
+                processing_at = CASE
+                    WHEN claim_id = %s THEN processing_at ELSE NOW()
+                END,
+                attempt_count = attempt_count + CASE
+                    WHEN claim_id = %s THEN 0 ELSE 1
+                END,
+                last_attempt_at = CASE
+                    WHEN claim_id = %s THEN last_attempt_at ELSE NOW()
+                END,
+                claim_id = %s
             WHERE session_id = %s
               AND group_id = %s
               AND user_id = %s
@@ -1450,41 +1562,79 @@ def claim_verification_session(session_id, group_id, user_id):
               AND consumed_at IS NULL
               AND expires_at > NOW()
               AND (
-                    status = 'pending'
+                    (status = 'processing' AND claim_id = %s)
                     OR (
-                        status = 'processing'
-                        AND processing_at < NOW() - INTERVAL '2 minutes'
+                        attempt_count < %s
+                        AND (
+                            status = 'pending'
+                            OR (
+                                status = 'processing'
+                                AND processing_at < NOW() - (%s * INTERVAL '1 second')
+                            )
+                        )
                     )
               )
-            RETURNING session_id
+            RETURNING claim_id
             """,
-            (session_id, group_id, user_id),
+            (
+                claim_id,
+                claim_id,
+                claim_id,
+                claim_id,
+                session_id,
+                group_id,
+                user_id,
+                claim_id,
+                VERIFICATION_SESSION_MAX_ATTEMPTS,
+                VERIFICATION_PROCESSING_LEASE_SECONDS,
+            ),
         )
-        return cur.fetchone() is not None
+        row = cur.fetchone()
+        return row[0] if row else None
 
 
 @db_retry
-def release_verification_session(session_id, group_id, user_id):
+def get_verification_attempt_state(session_id):
+    """Return attempt state used to distinguish contention from exhaustion."""
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """
+            SELECT attempt_count, status, completed_at, consumed_at
+            FROM verification_sessions
+            WHERE session_id = %s
+            """,
+            (session_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "attempt_count": row[0],
+        "status": row[1],
+        "completed": row[2] is not None or row[3] is not None,
+    }
+
+
+def release_verification_session(session_id, group_id, user_id, claim_id):
     """Return a claimed session to pending after an indeterminate failure."""
     with get_db_cursor() as (conn, cur):
         cur.execute(
             """
             UPDATE verification_sessions
-            SET status = 'pending', processing_at = NULL
+            SET status = 'pending', processing_at = NULL, claim_id = NULL
             WHERE session_id = %s
               AND group_id = %s
               AND user_id = %s
               AND status = 'processing'
+              AND claim_id = %s
               AND completed_at IS NULL
               AND consumed_at IS NULL
-              AND expires_at > NOW()
             """,
-            (session_id, group_id, user_id),
+            (session_id, group_id, user_id, claim_id),
         )
         return cur.rowcount == 1
 
 
-@db_retry
 def finalize_verified_wallet(
     session_id,
     group_id,
@@ -1492,6 +1642,8 @@ def finalize_verified_wallet(
     username,
     wallet_address,
     registration_type,
+    eligibility_status,
+    claim_id,
 ):
     """Atomically save a verified wallet and complete its claimed session."""
     with get_db_cursor() as (conn, cur):
@@ -1504,13 +1656,40 @@ def finalize_verified_wallet(
               AND user_id = %s
               AND completed_at IS NULL
               AND consumed_at IS NULL
-              AND expires_at > NOW()
+              AND status = 'processing'
+              AND claim_id = %s
+              AND processing_at >= NOW() - (%s * INTERVAL '1 second')
             FOR UPDATE
             """,
-            (session_id, group_id, user_id),
+            (
+                session_id,
+                group_id,
+                user_id,
+                claim_id,
+                VERIFICATION_PROCESSING_LEASE_SECONDS,
+            ),
         )
         row = cur.fetchone()
-        if row is None or row[0] != 'processing':
+        if row is None:
+            cur.execute(
+                """
+                SELECT wallet_address, eligibility_status
+                FROM verification_sessions
+                WHERE session_id = %s
+                  AND group_id = %s
+                  AND user_id = %s
+                  AND status = 'completed'
+                  AND consumed_at IS NOT NULL
+                """,
+                (session_id, group_id, user_id),
+            )
+            completed = cur.fetchone()
+            return bool(
+                completed
+                and completed[0] == wallet_address
+                and completed[1] == eligibility_status
+            )
+        if row[0] != 'processing':
             return False
         _save_wallet_for_user_with_cursor(
             cur,
@@ -1522,13 +1701,24 @@ def finalize_verified_wallet(
         )
         cur.execute(
             """
+            DELETE FROM pending_verifications
+            WHERE user_id = %s AND group_id = %s
+            """,
+            (user_id, group_id),
+        )
+        cur.execute(
+            """
             UPDATE verification_sessions
             SET status = 'completed',
                 completed_at = NOW(),
-                consumed_at = NOW()
+                consumed_at = NOW(),
+                processing_at = NULL,
+                claim_id = NULL,
+                wallet_address = %s,
+                eligibility_status = %s
             WHERE session_id = %s
             """,
-            (session_id,),
+            (wallet_address, eligibility_status, session_id),
         )
         return cur.rowcount == 1
 
@@ -3459,13 +3649,12 @@ def show_mywallets_private(chat_id, group_id):
             logging.warning(f"Could not resolve group title for {group_id}: {e}")
             group_name = f"Group {group_id}"
 
-        # Get group configuration for balance checking and link generation
+        # Get group configuration for holdings display.
         with config_lock:
             config = SUBSCRIBER_CONFIGS.get(group_id, {})
 
         # Build registration URL for the website-gated flow
-        connect_url = build_wallet_connect_url(group_id, user_id, cfg=config)
-        verify_url = f"{connect_url}&source=telegram_mywallets"
+        verify_url = build_wallet_connect_url(group_id, user_id)
 
         markup = types.InlineKeyboardMarkup()
         verify_btn = types.InlineKeyboardButton("➕ Add/Verify Wallet", url=verify_url)
@@ -4933,9 +5122,19 @@ def get_user_nft_category_count(
         return None
 
 
-def evaluate_wallet_requirements(wallet_address, cfg, user_id=None, force_fresh=False):
+def evaluate_wallet_requirements(
+    wallet_address,
+    cfg,
+    user_id=None,
+    force_fresh=False,
+    deadline_monotonic=None,
+):
     """Evaluate requirements as PASS, FAIL, or INDETERMINATE."""
-    operation_deadline = time.monotonic() + SUI_OPERATION_TIMEOUT_SECONDS
+    operation_deadline = (
+        deadline_monotonic
+        if deadline_monotonic is not None
+        else time.monotonic() + SUI_OPERATION_TIMEOUT_SECONDS
+    )
     wallet_lower = wallet_address.lower()
     registration_mode = cfg.get("registration_mode", "token")
     token = cfg.get("token", "")
@@ -5631,20 +5830,35 @@ def handle_start(message):
             group_id_str = param[len("register_"):]
             try:
                 group_id = decode_group_id_from_deeplink(group_id_str)
-                with get_db_cursor() as (conn, cur):
-                    cur.execute("""
-                        INSERT INTO pending_verifications (user_id, group_id, created_at)
-                        VALUES (%s, %s, NOW())
-                        ON CONFLICT (user_id) DO UPDATE SET
-                            group_id = EXCLUDED.group_id,
-                            created_at = EXCLUDED.created_at
-                    """, (message.from_user.id, group_id))
-                # Send a URL button that opens the /verify page directly in the
-                # user's external browser so wallet extensions are available.
                 with config_lock:
-                    group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
-                connect_url = build_wallet_connect_url(group_id, message.from_user.id, cfg=group_cfg)
-                verify_url = f"{connect_url}&source=telegram_register"
+                    group_is_configured = group_id in SUBSCRIBER_CONFIGS
+                if not group_is_configured:
+                    bot.reply_to(
+                        message,
+                        "❌ Wallet registration is not configured for this group. "
+                        "Please ask a group administrator to run /cwconfig.",
+                    )
+                    return
+                try:
+                    # Validate the public endpoint before touching registration
+                    # state, then create both compatibility context and session.
+                    get_public_api_base_url()
+                    verify_url = build_wallet_connect_url(
+                        group_id,
+                        message.from_user.id,
+                        update_pending_context=True,
+                    )
+                except Exception as exc:
+                    logging.error(
+                        "Wallet verification link issuance failed: %s",
+                        exc,
+                    )
+                    bot.reply_to(
+                        message,
+                        "❌ Wallet verification is temporarily unavailable. "
+                        "Please try again shortly or contact a group administrator.",
+                    )
+                    return
                 markup = types.InlineKeyboardMarkup()
                 markup.add(types.InlineKeyboardButton("✅ Verify Wallet", url=verify_url))
                 bot.reply_to(
@@ -5723,51 +5937,19 @@ def handle_start(message):
     else:
         bot.reply_to(message, "👋 Welcome to CityWatch! Use /help to see available commands.")
 
-def build_wallet_connect_url(group_id, user_id, cfg=None):
-    """Build a session-only URL for an allowlisted verification page."""
-    public_base = get_public_webapp_base_url()
-    local_base_url = f"{public_base.rstrip('/')}/verify" if public_base else FALLBACK_VERIFY_URL
-    base_url = local_base_url
-    if WALLET_CONNECT_URL:
-        parsed = urlsplit(WALLET_CONNECT_URL)
-        host = (parsed.hostname or '').lower()
-        is_local_dev = host in {'localhost', '127.0.0.1'} and parsed.scheme == 'http'
-        if (
-            parsed.scheme == 'https'
-            and host in WALLET_CONNECT_ALLOWED_HOSTS
-        ) or is_local_dev:
-            base_url = WALLET_CONNECT_URL
-        else:
-            logging.error(
-                "Ignoring WALLET_CONNECT_URL because its scheme/host is not allowlisted: %s",
-                WALLET_CONNECT_URL,
-            )
-
-    verification_session = create_verification_session(group_id, user_id)
-    if public_base:
-        api_verify_url = f"{public_base.rstrip('/')}/api/verify"
-    else:
-        api_verify_url = (
-            "/api/verify"
-            if base_url == local_base_url
-            else f"{FALLBACK_VERIFY_URL.rsplit('/verify', 1)[0]}/api/verify"
-        )
-
-    if base_url != local_base_url:
-        separator = '&' if '#' in base_url else '#'
-        url = (
-            f"{base_url}{separator}"
-            f"verification_session={quote(verification_session, safe='')}"
-            f"&api_verify_url={quote(api_verify_url, safe='')}"
-        )
-    else:
-        separator = '&' if '?' in base_url else '?'
-        url = (
-            f"{base_url}{separator}"
-            f"verification_session={quote(verification_session, safe='')}"
-        )
-
-    return url
+def build_wallet_connect_url(group_id, user_id, *, update_pending_context=False):
+    """Build an Alpha City URL containing only fragment-scoped secrets."""
+    api_verify_url = f"{get_public_api_base_url()}/api/verify"
+    verification_session = create_verification_session(
+        group_id,
+        user_id,
+        update_pending_context=update_pending_context,
+    )
+    return build_hosted_verification_url(
+        WALLET_CONNECT_URL,
+        verification_session,
+        api_verify_url,
+    )
 
 
 def build_registration_restart_url(group_id):
@@ -5782,6 +5964,15 @@ def build_registration_restart_url(group_id):
             group_id,
             exc,
         )
+        return ""
+
+
+def build_telegram_return_url():
+    """Return users to the bot without starting another registration."""
+    try:
+        return f"https://t.me/{get_bot_username()}"
+    except Exception as exc:
+        logging.debug("Could not build Telegram return URL: %s", exc)
         return ""
 
 
@@ -5834,8 +6025,6 @@ def register_wallets(message):
             (user_id, group_id)
         )
 
-    with config_lock:
-        group_cfg = SUBSCRIBER_CONFIGS.get(group_id)
     # Use a generic deep link so each user who clicks the button starts their
     # own private verification session under their own Telegram ID.  This
     # prevents cross-registration if the group message is seen by other members.
@@ -5928,6 +6117,47 @@ def _send_group_verified_notification(group_id, display_name):
 
 # ==================== Flask API Endpoints ========================
 
+def _completed_verification_payload(completed, restart_url):
+    """Build the stable response returned by completed-session replays."""
+    eligibility_status = completed.get("eligibility_status") or "unknown"
+    if eligibility_status == "fail":
+        return ({
+            'success': False,
+            'error': 'Wallet does not meet group requirements',
+            'message': (
+                'Wallet ownership was verified and the address was registered, '
+                'but current holdings do not meet this group’s requirements.'
+            ),
+            'retryable': False,
+            'ownership_verified': True,
+            'wallet_registered': True,
+            'eligibility_status': 'fail',
+            'requirements_met': False,
+            'restart_url': restart_url,
+            'replayed': True,
+        }, 403)
+    if eligibility_status == "pass":
+        return ({
+            'success': True,
+            'message': 'Wallet verified and registered successfully',
+            'ownership_verified': True,
+            'wallet_registered': True,
+            'eligibility_status': 'pass',
+            'requirements_met': True,
+            'restart_url': restart_url,
+            'replayed': True,
+        }, 200)
+    return ({
+        'success': True,
+        'message': 'Wallet registration was already completed. Check Telegram for details.',
+        'ownership_verified': True,
+        'wallet_registered': True,
+        'eligibility_status': 'unknown',
+        'requirements_met': None,
+        'restart_url': restart_url,
+        'replayed': True,
+    }, 200)
+
 def _add_cors_headers(response):
     """Add credential-free CORS headers only for configured page origins."""
     origin = (request.headers.get('Origin') or '').rstrip('/')
@@ -6004,6 +6234,12 @@ def verification_context():
     if request.method == 'OPTIONS':
         return _add_cors_headers(jsonify({}))
     verification_session = request.args.get('verification_session', '')
+    if not is_valid_verification_session_id(verification_session):
+        return _add_cors_headers(jsonify({
+            'success': False,
+            'error': 'Verification link is invalid.',
+            'restart_url': '',
+        })), 400
     rate_key = f"context:{request.remote_addr}:{verification_session}"
     if not verification_rate_limiter.allow(rate_key):
         return _add_cors_headers(jsonify({
@@ -6012,6 +6248,20 @@ def verification_context():
         })), 429
     session = get_active_verification_session(verification_session)
     if not session:
+        completed = get_completed_verification_result(verification_session)
+        if completed:
+            restart_url = build_registration_restart_url(completed['group_id'])
+            completed_payload, _ = _completed_verification_payload(
+                completed,
+                restart_url,
+            )
+            return _add_cors_headers(jsonify({
+                'success': True,
+                'verification_completed': True,
+                'verification_result': completed_payload,
+                'restart_url': restart_url,
+                'telegram_return_url': build_telegram_return_url(),
+            }))
         expired_group_id = get_verification_session_group(
             verification_session
         )
@@ -6055,6 +6305,7 @@ def verification_context():
         'group_id': str(session['group_id']),
         'telegram_user_id': str(session['user_id']),
         'restart_url': build_registration_restart_url(session['group_id']),
+        'telegram_return_url': build_telegram_return_url(),
         'requirements': {
             'registration_mode': cfg.get('registration_mode', 'token'),
             'minimum_holding': str(cfg.get('minimum_holding', 0)),
@@ -6082,7 +6333,10 @@ def api_verify():
     group_id = None
     tg_user_id = None
     restart_url = ''
+    wallet_address = ''
+    claim_id = None
     claimed = False
+    verification_work_acquired = False
     runtime_metrics.increment("verification_attempts")
     try:
         data = request.get_json(silent=True) or {}
@@ -6092,24 +6346,49 @@ def api_verify():
                 'error': 'JSON object required',
             })), 400
 
-        wallet_address = (
-            data.get('wallet_address') or data.get('walletAddress') or ''
-        ).strip()
-        verification_session = data.get('verification_session') or data.get('verificationSession') or ''
-        wallet_signature = data.get('wallet_signature') or data.get('walletSignature') or ''
+        wallet_value = data.get('wallet_address') or data.get('walletAddress') or ''
+        session_value = data.get('verification_session') or data.get('verificationSession') or ''
+        signature_value = data.get('wallet_signature') or data.get('walletSignature') or ''
+        wallet_address = wallet_value.strip() if isinstance(wallet_value, str) else ''
+        verification_session = session_value if isinstance(session_value, str) else ''
+        wallet_signature = signature_value if isinstance(signature_value, str) else ''
 
+        if not is_valid_verification_session_id(verification_session):
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Verification link is invalid.',
+            })), 400
+        if not wallet_signature or len(wallet_signature) > 4096:
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Wallet signature is missing or invalid.',
+            })), 400
         rate_key = f"verify:{request.remote_addr}:{verification_session}"
         if not verification_rate_limiter.allow(rate_key):
             return _add_cors_headers(jsonify({
                 'success': False,
                 'error': 'Too many verification attempts. Please wait and try again.',
             })), 429
-        if not is_valid_wallet_address(wallet_address):
+        canonical_wallet = canonical_sui_address(wallet_address)
+        if canonical_wallet is None:
             return _add_cors_headers(jsonify({
                 'success': False,
                 'error': 'Invalid wallet address',
             })), 400
-        wallet_address = require_canonical_sui_address(wallet_address)
+        wallet_address = canonical_wallet
+
+        completed = get_completed_verification_result(
+            verification_session,
+            wallet_address,
+        )
+        if completed:
+            restart_url = build_registration_restart_url(completed['group_id'])
+            payload, status_code = _completed_verification_payload(
+                completed,
+                restart_url,
+            )
+            runtime_metrics.increment("verification_result_replays")
+            return _add_cors_headers(jsonify(payload)), status_code
 
         session = get_active_verification_session(verification_session)
         if not session:
@@ -6120,31 +6399,90 @@ def api_verify():
         group_id = session['group_id']
         tg_user_id = session['user_id']
         restart_url = build_registration_restart_url(group_id)
-        attempt_number = consume_verification_attempt(verification_session)
-        if attempt_number is None:
-            runtime_metrics.increment("verification_session_rate_limited")
-            return _add_cors_headers(jsonify({
-                'success': False,
-                'error': (
-                    'This verification link has reached its attempt limit. '
-                    'Please request a new link in Telegram.'
-                ),
-                'retryable': False,
-                'restart_url': restart_url,
-            })), 429
 
-        try:
-            ownership_message = build_wallet_ownership_message(verification_session, group_id, tg_user_id, wallet_address)
-        except ValueError:
+        with config_lock:
+            cfg = dict(SUBSCRIBER_CONFIGS.get(group_id, {}))
+        if not cfg:
             return _add_cors_headers(jsonify({
                 'success': False,
-                'error': 'Invalid wallet address',
+                'error': 'Group is not configured. Ask an admin to run /cwconfig first.',
+                'restart_url': restart_url,
             })), 400
+
+        verification_work_acquired = _verification_work_slots.acquire(
+            blocking=False
+        )
+        if not verification_work_acquired:
+            runtime_metrics.increment("verification_capacity_limited")
+            response = _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Verification is busy right now. Please wait a moment and try again.',
+                'retryable': True,
+                'restart_url': restart_url,
+            }))
+            response.headers['Retry-After'] = '3'
+            return response, 503
+
+        claim_id = secrets.token_urlsafe(24)
+        claimed = True
+        claimed_id = claim_verification_session(
+            verification_session,
+            group_id,
+            tg_user_id,
+            claim_id,
+        )
+        if not claimed_id:
+            claimed = False
+            # The winning request might have committed between our initial
+            # replay check and this claim attempt.
+            completed = get_completed_verification_result(
+                verification_session,
+                wallet_address,
+            )
+            if completed:
+                payload, status_code = _completed_verification_payload(
+                    completed,
+                    restart_url,
+                )
+                runtime_metrics.increment("verification_result_replays")
+                return _add_cors_headers(jsonify(payload)), status_code
+            attempt_state = get_verification_attempt_state(verification_session)
+            if (
+                attempt_state
+                and not attempt_state["completed"]
+                and attempt_state["attempt_count"] >= VERIFICATION_SESSION_MAX_ATTEMPTS
+            ):
+                runtime_metrics.increment("verification_session_rate_limited")
+                return _add_cors_headers(jsonify({
+                    'success': False,
+                    'error': (
+                        'This verification link has reached its attempt limit. '
+                        'Please request a new link in Telegram.'
+                    ),
+                    'retryable': False,
+                    'restart_url': restart_url,
+                })), 429
+            response = _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Verification is already being processed. Please wait a moment and try again.',
+                'retryable': True,
+                'restart_url': restart_url,
+            }))
+            response.headers['Retry-After'] = '3'
+            return response, 409
+        ownership_message = build_wallet_ownership_message(
+            verification_session,
+            group_id,
+            tg_user_id,
+            wallet_address,
+        )
+        operation_deadline = time.monotonic() + SUI_OPERATION_TIMEOUT_SECONDS
         try:
             signature_valid = sui_gateway.verify_personal_message(
                 author=wallet_address,
                 message=ownership_message,
                 signature=wallet_signature,
+                deadline_monotonic=operation_deadline,
             )
         except SuiGatewayError as exc:
             runtime_metrics.increment("verification_signature_unavailable")
@@ -6178,26 +6516,15 @@ def api_verify():
                 'restart_url': restart_url,
             })), 409
 
-        with config_lock:
-            cfg = SUBSCRIBER_CONFIGS.get(group_id)
-        if not cfg:
-            return _add_cors_headers(jsonify({
-                'success': False,
-                'error': 'Group is not configured. Ask an admin to run /cwconfig first.',
-            })), 400
-
-        if not claim_verification_session(verification_session, group_id, tg_user_id):
-            return _add_cors_headers(jsonify({
-                'success': False,
-                'error': 'Verification link is already being processed, used, or expired.',
-            })), 409
-        claimed = True
-
-        requirement_eval = evaluate_wallet_requirements(wallet_address, cfg, user_id=tg_user_id, force_fresh=True)
+        requirement_eval = evaluate_wallet_requirements(
+            wallet_address,
+            cfg,
+            user_id=tg_user_id,
+            force_fresh=True,
+            deadline_monotonic=operation_deadline,
+        )
         if requirement_eval.get('status') == 'indeterminate':
             runtime_metrics.increment("verification_holdings_unavailable")
-            release_verification_session(verification_session, group_id, tg_user_id)
-            claimed = False
             return _add_cors_headers(jsonify({
                 'success': False,
                 'error': 'Unable to verify on-chain holdings right now. Please try again.',
@@ -6217,20 +6544,23 @@ def api_verify():
                 username,
                 wallet_address,
                 cfg.get("registration_mode", "token"),
+                'pass' if requirement_eval['requirements_met'] else 'fail',
+                claim_id,
             )
         except psycopg2.IntegrityError:
-            release_verification_session(verification_session, group_id, tg_user_id)
-            claimed = False
             return _add_cors_headers(jsonify({
                 'success': False,
                 'error': 'Wallet already registered to another user in this group',
+                'ownership_verified': True,
+                'wallet_registered': False,
+                'restart_url': restart_url,
             })), 409
         if not success:
-            release_verification_session(verification_session, group_id, tg_user_id)
-            claimed = False
             return _add_cors_headers(jsonify({
                 'success': False,
                 'error': 'Failed to complete verification. Please try again.',
+                'retryable': True,
+                'restart_url': restart_url,
             })), 500
         claimed = False
 
@@ -6242,12 +6572,6 @@ def api_verify():
                 update_user_cached_holdings(group_id, tg_user_id, nft_count=_nft, trait_count=_trait, token_balance=_bal)
             except Exception as e:
                 logging.debug(f"Could not update cached holdings for user {tg_user_id}: {e}")
-
-        with get_db_cursor() as (conn, cur):
-            cur.execute(
-                "DELETE FROM pending_verifications WHERE user_id = %s",
-                (tg_user_id,),
-            )
 
         if not requirement_eval['requirements_met']:
             runtime_metrics.increment("verification_registered_ineligible")
@@ -6304,15 +6628,46 @@ def api_verify():
     except Exception as e:
         runtime_metrics.increment("verification_internal_errors")
         logging.exception("Error in api_verify")
-        if claimed and verification_session and group_id is not None and tg_user_id is not None:
+        if verification_session and wallet_address:
             try:
-                release_verification_session(verification_session, group_id, tg_user_id)
+                completed = get_completed_verification_result(
+                    verification_session,
+                    wallet_address,
+                )
+                if completed:
+                    payload, status_code = _completed_verification_payload(
+                        completed,
+                        build_registration_restart_url(completed['group_id']),
+                    )
+                    runtime_metrics.increment("verification_result_replays")
+                    return _add_cors_headers(jsonify(payload)), status_code
             except Exception:
-                logging.exception("Could not release failed verification session")
+                logging.exception("Could not reconcile an ambiguous verification commit")
         return _add_cors_headers(jsonify({
             'success': False,
             'error': 'Internal server error',
+            'retryable': bool(claimed),
+            'restart_url': restart_url,
         })), 500
+    finally:
+        if (
+            claimed
+            and claim_id
+            and verification_session
+            and group_id is not None
+            and tg_user_id is not None
+        ):
+            try:
+                release_verification_session(
+                    verification_session,
+                    group_id,
+                    tg_user_id,
+                    claim_id,
+                )
+            except Exception:
+                logging.exception("Could not release failed verification session")
+        if verification_work_acquired:
+            _verification_work_slots.release()
 
 
 @app.route('/telegram/webhook', methods=['POST'])
@@ -6507,6 +6862,8 @@ def readiness_check():
         "status": "ready",
         "database": "healthy",
         "sui_graphql": "healthy",
+        "wallet_registration": "healthy",
+        "wallet_connect_url": WALLET_CONNECT_URL,
         "sui_graphql_providers": sui_gateway.provider_status(),
         "chain_identifier": None,
         "timestamp": time.time(),
@@ -6524,6 +6881,11 @@ def readiness_check():
     except Exception as exc:
         payload["sui_graphql"] = f"unhealthy: {type(exc).__name__}"
         status_code = 503
+    try:
+        payload["public_api_base_url"] = get_public_api_base_url()
+    except Exception as exc:
+        payload["wallet_registration"] = f"unhealthy: {type(exc).__name__}"
+        status_code = 503
     if status_code != 200:
         payload["status"] = "not_ready"
     with _readiness_lock:
@@ -6535,23 +6897,7 @@ def readiness_check():
     return jsonify(payload), status_code
 
 def is_valid_wallet_address(address):
-    if not address:
-        return False
-    address = address.strip()
-    if not address.lower().startswith('0x'):
-        logging.info(f"Wallet validation failed - does not start with 0x: {address}")
-        return False
-    address_without_prefix = address[2:]
-    clean_address = ''.join(c for c in address_without_prefix if c.isalnum())
-    try:
-        int(clean_address, 16)
-        valid = 1 <= len(clean_address) <= 64
-        if not valid:
-            logging.info(f"Wallet validation failed - invalid length ({len(clean_address)}): {address}")
-        return valid
-    except ValueError:
-        logging.info(f"Wallet validation failed - not hexadecimal: {address}")
-        return False
+    return canonical_sui_address(address) is not None
 
 # ==================== New Functions =============================
 
@@ -6629,7 +6975,12 @@ if __name__ == "__main__":
     keepalive_thread.start()
 
     flask_thread = threading.Thread(
-        target=lambda: waitress_serve(app, host=HOST, port=PORT, threads=4),
+        target=lambda: waitress_serve(
+            app,
+            host=HOST,
+            port=PORT,
+            threads=WAITRESS_THREADS,
+        ),
         name="waitress-server",
     )
     flask_thread.daemon = True
