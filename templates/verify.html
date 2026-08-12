@@ -6,10 +6,10 @@
   <meta name="referrer" content="no-referrer">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://telegram.org; connect-src 'self' https: http://localhost:* http://127.0.0.1:*; img-src 'self' data: https:; style-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>Wallet Verification | Alpha City</title>
-  <link rel="stylesheet" href="/static/verify.css?v=20260812-2">
+  <link rel="stylesheet" href="/static/verify.css?v=20260812-3">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script defer src="/static/wallet-connector.js?v=20260812-2"></script>
-  <script defer src="/static/verify.js?v=20260812-2"></script>
+  <script defer src="/static/wallet-connector.js?v=20260812-3"></script>
+  <script defer src="/static/verify.js?v=20260812-3"></script>
 </head>
 <body
   data-api-verify-url="{{ api_verify_url|e }}"
@@ -29,7 +29,7 @@
   <header class="page-intro">
     <div class="eyebrow">Secure wallet verification</div>
     <h1>Verify your Sui wallet</h1>
-    <p class="subtitle">Connect with the same Alpha City wallet picker, review the ownership message, and register without approving a transaction.</p>
+    <p class="subtitle">Confirm wallet and holdings via non-transactional signature. Zero risk to your holdings</p>
   </header>
 
   <div class="steps" aria-label="Verification progress">
@@ -73,8 +73,7 @@
           <button class="compact secondary" id="copyMessageButton" type="button">Copy message</button>
         </div>
         <button id="signButton" type="button">Sign ownership message</button>
-        <div class="signed-status" id="signedStatus" hidden>✓ Ownership message signed</div>
-        <button id="submitButton" type="button" hidden disabled>Submit verification</button>
+        <div class="signed-status" id="signedStatus" hidden>✓ Ownership message signed — checking holdings…</div>
         <button class="secondary" id="changeButton" type="button">Switch wallet or account</button>
       </div>
 

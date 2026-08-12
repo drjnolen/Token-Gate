@@ -65,7 +65,6 @@
   const walletCard = document.getElementById('walletCard');
   const connectWalletButton = document.getElementById('connectWalletButton');
   const signButton = document.getElementById('signButton');
-  const submitButton = document.getElementById('submitButton');
   const changeButton = document.getElementById('changeButton');
   const reviewPanel = document.getElementById('reviewPanel');
   const contextRecovery = document.getElementById('contextRecovery');
@@ -217,8 +216,6 @@
     document.getElementById('signedStatus').hidden = true;
     signButton.hidden = false;
     signButton.disabled = false;
-    submitButton.hidden = true;
-    submitButton.disabled = true;
     if (!session) {
       selectedAddress = '';
       reviewPanel.hidden = true;
@@ -392,7 +389,6 @@
   async function submitVerification() {
     if (!selectedAddress || !selectedSignature || submissionInFlight) return;
     submissionInFlight = true;
-    submitButton.disabled = true;
     document.getElementById('retryButton').disabled = true;
     setStep(2);
     try {
@@ -437,7 +433,6 @@
       });
     } finally {
       submissionInFlight = false;
-      submitButton.disabled = false;
       document.getElementById('retryButton').disabled = false;
     }
   }
@@ -466,10 +461,9 @@
       selectedSignature = await signOwnership();
       document.getElementById('signedStatus').hidden = false;
       signButton.hidden = true;
-      submitButton.hidden = false;
-      submitButton.disabled = false;
       clearNotice('walletNotice');
       track('transaction_sign', { status: 'success' });
+      await submitVerification();
     } catch (error) {
       signButton.disabled = false;
       showNotice(
@@ -507,7 +501,6 @@
       showNotice('walletNotice', 'Could not copy automatically. Select the message text to copy it.', 'error');
     }
   });
-  submitButton.addEventListener('click', submitVerification);
   document.getElementById('retryButton').addEventListener('click', () => {
     document.getElementById('retryButton').hidden = true;
     clearNotice('resultNotice');

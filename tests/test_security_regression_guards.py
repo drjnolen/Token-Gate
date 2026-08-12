@@ -41,6 +41,7 @@ class EnforcementRegressionGuards(unittest.TestCase):
         self.assertIn("FOR UPDATE", finalize)
         self.assertIn("AND claim_id = %s", finalize)
         self.assertIn("DELETE FROM pending_verifications", finalize)
+        self.assertIn("holdings_summary = %s::jsonb", finalize)
         self.assertNotIn("expires_at > NOW()", finalize)
         release = FUNCTIONS["release_verification_session"]
         self.assertIn("AND claim_id = %s", release)
@@ -78,14 +79,19 @@ class EnforcementRegressionGuards(unittest.TestCase):
         self.assertNotIn("token_balance:", browser)
         self.assertNotIn("nft_count:", browser)
 
-    def test_verification_ux_separates_connect_review_sign_and_submit(self):
+    def test_verification_ux_auto_submits_after_explicit_message_signature(self):
         template = Path("templates/verify.html").read_text(encoding="utf-8")
         browser = Path("static/verify.js").read_text(encoding="utf-8")
         connector = Path("static/wallet-connector.js").read_text(encoding="utf-8")
         self.assertIn('id="connectWalletButton"', template)
         self.assertIn('id="ownershipMessage"', template)
         self.assertIn('id="signButton"', template)
-        self.assertIn('id="submitButton"', template)
+        self.assertNotIn('id="submitButton"', template)
+        self.assertIn(
+            "Confirm wallet and holdings via non-transactional signature. "
+            "Zero risk to your holdings",
+            template,
+        )
         self.assertIn("AlphaCityWalletConnector.create", browser)
         self.assertIn("alwaysPrompt: true", browser)
         self.assertIn("autoReconnect: false", browser)
@@ -94,6 +100,9 @@ class EnforcementRegressionGuards(unittest.TestCase):
         connect_index = browser.index("initWalletConnector()")
         sign_index = browser.index("signButton.addEventListener")
         self.assertLess(connect_index, sign_index)
+        signature_index = browser.index("selectedSignature = await signOwnership()")
+        submit_index = browser.index("await submitVerification()")
+        self.assertLess(signature_index, submit_index)
         self.assertIn("Wallet registered — requirements not met", browser)
         self.assertIn("verification_completed", browser)
         self.assertIn("submissionInFlight", browser)
@@ -152,7 +161,13 @@ class EnforcementRegressionGuards(unittest.TestCase):
         finalize = FUNCTIONS["finalize_verified_wallet"]
         self.assertIn("eligibility_status = %s", finalize)
         self.assertIn("wallet_address = %s", finalize)
+        self.assertIn("holdings_summary = %s::jsonb", finalize)
         self.assertIn("DELETE FROM pending_verifications", finalize)
+        completed = FUNCTIONS["get_completed_verification_result"]
+        self.assertIn("holdings_summary", completed)
+        payload = FUNCTIONS["_completed_verification_payload"]
+        self.assertIn("verification_success_message(holdings_summary)", payload)
+        self.assertIn("'qualifying_holdings': holdings_summary", payload)
         # Pending-context cleanup must be part of the same transaction that
         # completes the session, never an uncaught post-commit operation.
         self.assertNotIn("DELETE FROM pending_verifications", endpoint)
