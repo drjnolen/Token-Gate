@@ -6,9 +6,34 @@ import heapq
 import logging
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
 from typing import Any
+
+
+def bounded_executor_map(executor, function, values, *, max_pending=16):
+    """Preserve map ordering while bounding this caller's outstanding work."""
+    if max_pending < 1:
+        raise ValueError("max_pending must be positive")
+    iterator = iter(values)
+    pending = deque()
+    try:
+        for _ in range(max_pending):
+            try:
+                value = next(iterator)
+            except StopIteration:
+                break
+            pending.append(executor.submit(function, value))
+        while pending:
+            yield pending.popleft().result()
+            try:
+                value = next(iterator)
+            except StopIteration:
+                continue
+            pending.append(executor.submit(function, value))
+    finally:
+        for future in pending:
+            future.cancel()
 
 
 class SlidingWindowRateLimiter:
@@ -18,27 +43,32 @@ class SlidingWindowRateLimiter:
         self.limit = max(1, limit)
         self.window_seconds = max(1.0, window_seconds)
         self.max_keys = max(100, max_keys)
-        self._events: dict[str, deque[float]] = defaultdict(deque)
+        self._events: OrderedDict[str, deque[float]] = OrderedDict()
         self._lock = threading.Lock()
 
     def allow(self, key: str) -> bool:
-        now = time.monotonic()
-        cutoff = now - self.window_seconds
         with self._lock:
-            events = self._events[key]
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            # Ordered by the last accepted request: expire only the oldest
+            # entries, with amortized O(1) work instead of scanning every key.
+            while self._events:
+                oldest = next(iter(self._events))
+                if self._events[oldest][-1] > cutoff:
+                    break
+                self._events.popitem(last=False)
+            events = self._events.get(key)
+            if events is None:
+                # Never evict a live client's quota to admit a new identity.
+                if len(self._events) >= self.max_keys:
+                    return False
+                events = self._events[key] = deque()
             while events and events[0] <= cutoff:
                 events.popleft()
             if len(events) >= self.limit:
                 return False
             events.append(now)
-            if len(self._events) > self.max_keys:
-                stale_keys = [
-                    item_key
-                    for item_key, item_events in self._events.items()
-                    if not item_events or item_events[-1] <= cutoff
-                ]
-                for stale_key in stale_keys[: max(1, self.max_keys // 10)]:
-                    self._events.pop(stale_key, None)
+            self._events.move_to_end(key)
             return True
 
 
