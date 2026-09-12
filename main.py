@@ -44,6 +44,7 @@ from verification_results import (
     verification_success_message,
 )
 from runtime_support import (
+    bounded_executor_map,
     DelayedTaskScheduler,
     RuntimeMetrics,
     SlidingWindowRateLimiter,
@@ -325,9 +326,8 @@ def get_bot_id():
 _background_executor = ThreadPoolExecutor(
     max_workers=int(os.getenv('BACKGROUND_WORKERS', '4'))
 )
-_sui_executor = ThreadPoolExecutor(
-    max_workers=int(os.getenv('SUI_FETCH_WORKERS', '8'))
-)
+SUI_FETCH_WORKERS = max(1, int(os.getenv('SUI_FETCH_WORKERS', '8')))
+_sui_executor = ThreadPoolExecutor(max_workers=SUI_FETCH_WORKERS)
 _delayed_tasks = DelayedTaskScheduler()
 
 
@@ -347,9 +347,6 @@ if not database_url:
     raise ValueError("DATABASE_URL not found in environment variables")
 
 connection_pool = None
-# Pool health-check throttle: only run SELECT 1 every N seconds (not on every call).
-_POOL_CHECK_INTERVAL = 30  # seconds
-_pool_last_check = [0.0]  # mutable container so we don't need a global statement
 
 
 def get_public_webapp_base_url():
@@ -411,34 +408,11 @@ def db_retry(func):
 
 def get_connection_pool():
     global connection_pool, database_url
-    # Fast path: return the existing pool if it was validated recently.
-    # Only run an actual health check (SELECT 1) every _POOL_CHECK_INTERVAL
-    # seconds to avoid a round-trip query on every database operation.
+    # Pool exhaustion or one stale connection must never close connections
+    # borrowed by other requests. Readiness probes validate DB availability;
+    # failed transactions discard only their own unusable connection.
     if connection_pool:
-        now = time.time()
-        if now - _pool_last_check[0] < _POOL_CHECK_INTERVAL:
-            return connection_pool
-        # Time for a periodic health check
-        try:
-            conn = connection_pool.getconn()
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT 1")
-                cur.fetchone()
-                cur.close()
-                _pool_last_check[0] = now
-                return connection_pool
-            finally:
-                connection_pool.putconn(conn)
-        except Exception as e:
-            logging.warning(f"Connection pool test failed, will recreate: {e}")
-            try:
-                if connection_pool:
-                    connection_pool.closeall()
-                    time.sleep(2)  # Brief pause before recreating
-            except Exception as close_ex:
-                logging.error(f"Error closing connections: {close_ex}")
-            connection_pool = None
+        return connection_pool
 
     # Slow path: pool is None (or was just cleared).  Acquire db_lock so that
     # two threads that simultaneously see connection_pool == None don't each
@@ -482,23 +456,25 @@ def get_connection_pool():
         max_tries = 5
         backoff_time = 2
         while tries < max_tries:
+            candidate_pool = None
             try:
                 # Use the connection string directly with psycopg2 pool
-                connection_pool = pool.ThreadedConnectionPool(
+                candidate_pool = pool.ThreadedConnectionPool(
                     DB_POOL_MIN, DB_POOL_MAX,
                     connection_string,
                     connect_timeout=30,  # Increased timeout for production
                     application_name="wallet_alert_bot_production"
                 )
                 logging.info(f"Database connection pool created with {DB_POOL_MIN}-{DB_POOL_MAX} connections")
-                conn = connection_pool.getconn()
+                conn = candidate_pool.getconn()
                 try:
                     cur = conn.cursor()
                     cur.execute("SELECT 1")
                     cur.fetchone()
                     cur.close()
                 finally:
-                    connection_pool.putconn(conn)
+                    candidate_pool.putconn(conn)
+                connection_pool = candidate_pool
                 logging.info("Created new database connection pool")
                 return connection_pool
             except Exception as e:
@@ -522,12 +498,11 @@ def get_connection_pool():
 
                 time.sleep(backoff_time)
                 backoff_time *= 1.5
-                if connection_pool:
+                if candidate_pool:
                     try:
-                        connection_pool.closeall()
+                        candidate_pool.closeall()
                     except Exception:
                         pass
-                    connection_pool = None
 
         logging.error("Could not create database connection pool after multiple attempts")
         raise Exception("Database connection failed")
@@ -537,6 +512,7 @@ def get_db_cursor():
     pool_conn = None
     conn = None
     cur = None
+    discard_connection = False
     try:
         pool_conn = get_connection_pool()
         if not pool_conn:
@@ -552,6 +528,7 @@ def get_db_cursor():
             try:
                 conn.rollback()
             except Exception as rollback_error:
+                discard_connection = True
                 logging.error(f"Error during rollback: {rollback_error}")
         raise e
     finally:
@@ -562,13 +539,14 @@ def get_db_cursor():
                 logging.error(f"Error closing cursor: {cur_error}")
         if conn and pool_conn:
             try:
-                pool_conn.putconn(conn)
+                pool_conn.putconn(conn, close=discard_connection or bool(conn.closed))
             except Exception as e:
                 logging.error(f"Error returning connection to pool: {e}")
-                # If we can't return the connection, it might be dead - recreate pool
-                if "closed" in str(e).lower() or "exhausted" in str(e).lower():
-                    global connection_pool
-                    connection_pool = None
+                # Do not abandon the shared pool and leak other borrowers.
+                try:
+                    conn.close()
+                except Exception:
+                    logging.exception("Could not close unreturned database connection")
 
 @db_retry
 def init_db():
@@ -1818,14 +1796,16 @@ def fetch_wallet_balances(
     results = {}
     current_time = time.time()
     effective_cache_ttl = CACHE_TTL if cache_ttl is None else cache_ttl
-    monitored_token_lower = monitored_token.lower()
+    # Move module/struct names are case-sensitive, and cached values are
+    # already scaled. A decimals edit must not reuse the old display units.
+    cache_token = (monitored_token, int(decimals))
 
     # 1. Identify which addresses can be served from cache
     missing_addresses = []
     with cache_lock:
-        for addr in addresses:
+        for addr in dict.fromkeys(address.lower() for address in addresses):
             addr_lower = addr.lower()
-            cache_key = f"{addr_lower}|{monitored_token_lower}"
+            cache_key = (addr_lower, cache_token)
             if use_cache and cache_key in balance_cache:
                 cache_time, cached_val = balance_cache[cache_key]
                 if current_time - cache_time < effective_cache_ttl:
@@ -1857,7 +1837,10 @@ def fetch_wallet_balances(
                 logging.error("Failed to fetch on-chain balance for %s: %s", wallet, exc)
                 return wallet, None
 
-        for wallet, amount in _sui_executor.map(fetch_one, missing_addresses):
+        for wallet, amount in bounded_executor_map(
+            _sui_executor, fetch_one, missing_addresses,
+            max_pending=SUI_FETCH_WORKERS * 2,
+        ):
             results[wallet] = amount
             if amount is not None and use_cache:
                 with cache_lock:
@@ -1868,7 +1851,7 @@ def fetch_wallet_balances(
                         )
                         for old_key in sorted_keys[:MAX_CACHE_SIZE // 4]:
                             del balance_cache[old_key]
-                    cache_key = f"{wallet}|{monitored_token_lower}"
+                    cache_key = (wallet, cache_token)
                     balance_cache[cache_key] = (current_time, amount)
 
     return results
@@ -2113,7 +2096,7 @@ def check_user_wallets():
             ).start()
 
             with config_lock:
-                configs = dict(SUBSCRIBER_CONFIGS)
+                configs = {group_id: dict(cfg) for group_id, cfg in SUBSCRIBER_CONFIGS.items()}
             scan_started_monotonic = time.monotonic()
             with _wallet_scan_state_lock:
                 _wallet_scan_state.update({
