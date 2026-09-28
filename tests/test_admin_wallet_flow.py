@@ -228,12 +228,15 @@ class AdminWalletFlowTests(unittest.TestCase):
                               wallet_taken=self.taken, save_wallet=self.save)
         flow.register()
         flow.drafts[10] = self.ready()
+        flow.drafts[10].expires_at = flow.clock() + 900
+        flow.drafts[10].phase = "wallet"
         other_handler = Mock()
         bot.register_message_handler(other_handler, commands=["mywallets"])
         payload = {"message_id": 2, "date": 1, "chat": {"id": 10, "type": "private"},
                    "from": {"id": 10, "is_bot": False, "first_name": "Admin"}, "text": "/mywallets"}
         bot.process_new_messages([telebot.types.Message.de_json(payload)])
         other_handler.assert_called_once()
+        self.assertIn(10, flow.drafts)
 
     def test_cancel_command_does_not_save(self):
         self.ready()
