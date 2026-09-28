@@ -27,6 +27,7 @@ import stripe
 from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor
 from waitress import serve as waitress_serve
+from admin_wallet_flow import AdminWalletFlow
 from verification_security import (
     build_wallet_ownership_message,
     canonical_sui_address,
@@ -2757,6 +2758,22 @@ def admin_required(func):
         return func(message)
     return wrapper
 
+def _save_admin_selected_wallet(group_id, user, wallet):
+    with config_lock:
+        registration_type = SUBSCRIBER_CONFIGS.get(group_id, {}).get("registration_mode", "token")
+    return save_wallet_for_user(
+        group_id, user.id, get_telegram_user_display_name(user), [wallet],
+        replace_existing=False, registration_type=registration_type,
+    )
+
+
+_admin_wallet_flow = AdminWalletFlow(
+    bot, subscription_active=group_has_active_subscription,
+    wallet_taken=wallet_already_registered, save_wallet=_save_admin_selected_wallet,
+)
+_admin_wallet_flow.register()
+
+
 @bot.message_handler(
     content_types=['text'],
     func=lambda message: message.reply_to_message and \
@@ -3199,6 +3216,11 @@ def handle_private_config_callback(call):
         # --- THE REST OF THE FUNCTION LOGIC REMAINS THE SAME ---
         # (This combines the logic from the deleted function with the new one)
 
+        if action == "addmemberwallet":
+            _admin_wallet_flow.start(call.message, user_id, group_id)
+            return
+        _admin_wallet_flow.abandon(user_id)
+
         if action == "settokenconfig":
             msg = bot.send_message(call.message.chat.id, "Please provide the token address, minimum holding, and decimals, separated by spaces:", reply_markup=types.ForceReply(selective=True))
             bot.register_next_step_handler(msg, process_set_token_config, group_id)
@@ -3573,6 +3595,8 @@ def show_config_menu_private(chat_id, group_id):
         markup.add(btn12)
         markup.add(btn8, btn9)
         markup.add(btn10)
+        markup.add(types.InlineKeyboardButton(
+            "Add member wallet", callback_data=f"privconfig_{group_id}_addmemberwallet"))
         markup.add(btn11)
 
         bot.send_message(
