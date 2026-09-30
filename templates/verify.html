@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="/static/verify.css?v=20260812-3">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script defer src="/static/wallet-connector.js?v=20260812-3"></script>
-  <script defer src="/static/verify.js?v=20260812-3"></script>
+  <script defer src="/static/verify.js?v=20260929-1"></script>
 </head>
 <body
   data-api-verify-url="{{ api_verify_url|e }}"
@@ -53,7 +53,7 @@
       <button class="wallet-connect-button" id="connectWalletButton" type="button" disabled>
         Loading verification link…
       </button>
-      <p class="wallet-helper">You can switch the wallet provider or account before signing.</p>
+      <p class="wallet-helper">Holdings combine across your registered wallets for this group. You can switch wallet or account before signing, and add another wallet here if your total is below the requirement.</p>
 
       <div id="reviewPanel" hidden>
         <div class="connected">
@@ -101,6 +101,7 @@
       <h2 id="resultTitle"></h2>
       <p id="resultMessage"></p>
       <div class="result-actions">
+        <button id="addWalletButton" type="button" hidden>Add another wallet</button>
         <button class="secondary" id="retryButton" type="button" hidden>Try again</button>
         <button class="secondary" id="resultNewLinkButton" type="button" hidden>Request a new link</button>
         <button class="secondary" id="resultTelegramButton" type="button">Return to Telegram</button>

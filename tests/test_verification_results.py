@@ -4,10 +4,28 @@ from decimal import Decimal
 from verification_results import (
     qualifying_holdings_summary,
     verification_success_message,
+    verification_holdings_progress,
 )
 
 
 class VerificationResultTests(unittest.TestCase):
+    def test_multi_wallet_progress_preserves_fractional_precision(self):
+        progress = verification_holdings_progress(
+            {'token': 'CITY', 'minimum_holding': '1000000'},
+            {'token_balance': Decimal('999999.999999999'), 'wallet_count': 2},
+        )
+        self.assertIn('999,999.999999999 / 1,000,000 required', progress['message'])
+        self.assertIn('across 2 registered wallets', progress['message'])
+
+    def test_trait_progress_never_confuses_collection_and_trait_counts(self):
+        progress = verification_holdings_progress(
+            {'registration_mode': 'nft', 'nft_collection_id': 'NFT',
+             'nft_threshold': 5, 'nft_trait_name': 'Faction', 'nft_trait_threshold': 3},
+            {'nft_count': 7, 'trait_count': 2, 'wallet_count': 2},
+        )
+        self.assertIn('NFTs: 7 / 5 required', progress['message'])
+        self.assertIn('Matching-trait NFTs: 2 / 3 required', progress['message'])
+
     def test_token_success_reports_exact_grouped_balance(self):
         summary = qualifying_holdings_summary(
             {"registration_mode": "token", "token": "0x2::city::CITY"},

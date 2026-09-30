@@ -197,6 +197,7 @@ def expected_files(target: Path) -> dict[Path, bytes]:
         target / "verify" / "styles.css": CSS_SOURCE.read_bytes(),
         target / "shared" / "wallet-connector.js": CONNECTOR_SOURCE.read_bytes(),
         target / "tests" / "verify-page.test.cjs": VERIFY_TEST.encode(),
+        target / "tests" / "verify-flow.test.cjs": (ROOT / "tests" / "verify-flow.test.cjs").read_bytes(),
     }
 
 

@@ -29,6 +29,8 @@ from concurrent.futures import ThreadPoolExecutor
 from waitress import serve as waitress_serve
 from admin_wallet_flow import AdminWalletFlow
 from verification_security import (
+    RegistrationWalletsChanged,
+    canonical_wallets,
     build_wallet_ownership_message,
     canonical_sui_address,
     is_valid_verification_session_id,
@@ -41,6 +43,7 @@ from verification_config import (
     normalize_wallet_connect_url,
 )
 from verification_results import (
+    verification_holdings_progress,
     qualifying_holdings_summary,
     verification_success_message,
 )
@@ -630,7 +633,8 @@ def init_db():
                 claim_id TEXT DEFAULT NULL,
                 wallet_address TEXT DEFAULT NULL,
                 eligibility_status TEXT DEFAULT NULL,
-                holdings_summary JSONB DEFAULT NULL
+                holdings_summary JSONB DEFAULT NULL,
+                next_session_id TEXT DEFAULT NULL
             )
         """)
         cur.execute("""
@@ -753,6 +757,10 @@ def init_db():
             cur.execute(
                 "ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS "
                 "holdings_summary JSONB DEFAULT NULL"
+            )
+            cur.execute(
+                "ALTER TABLE verification_sessions ADD COLUMN IF NOT EXISTS "
+                "next_session_id TEXT DEFAULT NULL"
             )
             cur.execute(
                 "ALTER TABLE poll_votes ADD COLUMN IF NOT EXISTS "
@@ -986,6 +994,7 @@ def _save_wallet_for_user_with_cursor(
     is_exempt=None,
     replace_existing=False,
     registration_type="token",
+    expected_wallets=None,
 ):
     """Save JSON compatibility data and normalized addresses in one transaction."""
     normalized_incoming = [require_canonical_sui_address(wallet) for wallet in wallet_list]
@@ -1025,6 +1034,9 @@ def _save_wallet_for_user_with_cursor(
                 group_id,
                 user_id,
             )
+
+    if expected_wallets is not None and set(canonical_wallets(existing_wallets)) != set(expected_wallets):
+        raise RegistrationWalletsChanged()
 
     if is_exempt is None:
         is_exempt = existing_exempt
@@ -1505,7 +1517,8 @@ def get_completed_verification_result(session_id, wallet_address=None):
         cur.execute(
             """
             SELECT group_id, user_id, wallet_address, eligibility_status,
-                   holdings_summary
+                   holdings_summary,
+                   CASE WHEN expires_at > NOW() THEN next_session_id END
             FROM verification_sessions
             WHERE session_id = %s
               AND status = 'completed'
@@ -1525,6 +1538,7 @@ def get_completed_verification_result(session_id, wallet_address=None):
         "wallet_address": row[2],
         "eligibility_status": row[3] or "unknown",
         "holdings_summary": row[4] or {},
+        "next_verification_session": row[5],
     }
 
 
@@ -1635,6 +1649,7 @@ def finalize_verified_wallet(
     eligibility_status,
     holdings_summary,
     claim_id,
+    expected_wallets=None,
 ):
     """Atomically save a verified wallet and complete its claimed session."""
     with get_db_cursor() as (conn, cur):
@@ -1689,7 +1704,24 @@ def finalize_verified_wallet(
             username,
             [wallet_address],
             registration_type=registration_type,
+            expected_wallets=expected_wallets,
         )
+        # One child per completed session, committed with the wallet. Replays
+        # return this same child. Never extend the original authorization TTL.
+        next_session_id = None
+        if eligibility_status == 'fail':
+            candidate = secrets.token_urlsafe(32)
+            cur.execute(
+                """
+                INSERT INTO verification_sessions (session_id, group_id, user_id, expires_at)
+                SELECT %s, group_id, user_id, expires_at
+                FROM verification_sessions
+                WHERE session_id = %s AND expires_at > NOW()
+                """,
+                (candidate, session_id),
+            )
+            if cur.rowcount == 1:
+                next_session_id = candidate
         cur.execute(
             """
             DELETE FROM pending_verifications
@@ -1707,13 +1739,15 @@ def finalize_verified_wallet(
                 claim_id = NULL,
                 wallet_address = %s,
                 eligibility_status = %s,
-                holdings_summary = %s::jsonb
+                holdings_summary = %s::jsonb,
+                next_session_id = %s
             WHERE session_id = %s
             """,
             (
                 wallet_address,
                 eligibility_status,
                 json.dumps(holdings_summary or {}),
+                next_session_id,
                 session_id,
             ),
         )
@@ -5154,13 +5188,21 @@ def evaluate_wallet_requirements(
     force_fresh=False,
     deadline_monotonic=None,
 ):
-    """Evaluate requirements as PASS, FAIL, or INDETERMINATE."""
+    """Evaluate combined wallets as PASS, FAIL, or INDETERMINATE.
+
+    A scalar address remains supported for existing callers. Missing provider
+    results never contribute a fabricated zero to the combined balance.
+    """
     operation_deadline = (
         deadline_monotonic
         if deadline_monotonic is not None
         else time.monotonic() + SUI_OPERATION_TIMEOUT_SECONDS
     )
-    wallet_lower = wallet_address.lower()
+    wallets = canonical_wallets(
+        [wallet_address] if isinstance(wallet_address, str) else wallet_address
+    )
+    if not wallets:
+        raise ValueError("At least one valid wallet is required")
     registration_mode = cfg.get("registration_mode", "token")
     token = cfg.get("token", "")
     decimals = cfg.get("decimals", 6)
@@ -5191,13 +5233,16 @@ def evaluate_wallet_requirements(
     use_cache_flag = not force_fresh
     if registration_mode in ["token", "both"] and token:
         balances = fetch_wallet_balances(
-            [wallet_lower],
+            wallets,
             token,
             decimals,
             use_cache=use_cache_flag,
             deadline_monotonic=operation_deadline,
         )
-        token_balance = balances.get(wallet_lower)
+        amounts = [balances.get(wallet) for wallet in wallets]
+        token_balance = (
+            sum(amounts, Decimal(0)) if all(amount is not None for amount in amounts) else None
+        )
         if token_balance is None:
             token_indeterminate = True
             errors.append("⚠️ Unable to verify token balance right now. Please retry in a moment.")
@@ -5211,7 +5256,7 @@ def evaluate_wallet_requirements(
 
     if registration_mode in ["nft", "both"] and nft_collection_id:
         nft_count = get_user_nft_count(
-            [wallet_lower],
+            wallets,
             nft_collection_id,
             use_cache=use_cache_flag,
             deadline_monotonic=operation_deadline,
@@ -5221,9 +5266,9 @@ def evaluate_wallet_requirements(
         # false negatives when the user's NFTs are inside SUI Kiosks.
         if nft_count is None and force_fresh:
             time.sleep(NFT_PROVIDER_RETRY_DELAY)
-            logging.info(f"Retrying NFT count for wallet {wallet_lower} after initial provider failure")
+            logging.info("Retrying NFT count for %s wallets after provider failure", len(wallets))
             nft_count = get_user_nft_count(
-                [wallet_lower],
+                wallets,
                 nft_collection_id,
                 use_cache=False,
                 deadline_monotonic=operation_deadline,
@@ -5240,7 +5285,7 @@ def evaluate_wallet_requirements(
             try:
                 if nft_trait_value:
                     trait_count = get_user_nft_trait_count(
-                        [wallet_lower],
+                        wallets,
                         nft_collection_id,
                         nft_trait_name,
                         nft_trait_value,
@@ -5250,7 +5295,7 @@ def evaluate_wallet_requirements(
                     trait_desc = f"{nft_trait_name} = {nft_trait_value}"
                 else:
                     trait_count = get_user_nft_category_count(
-                        [wallet_lower],
+                        wallets,
                         nft_collection_id,
                         nft_trait_name,
                         use_cache=use_cache_flag,
@@ -5304,6 +5349,7 @@ def evaluate_wallet_requirements(
         "nft_count": nft_count,
         "trait_count": trait_count,
         "token_balance": token_balance,
+        "wallet_count": len(wallets),
     }
 
 @db_retry
@@ -6112,6 +6158,8 @@ def _build_verification_success_message(group_id, wallet_address, requirement_ev
         f"*Group:* {group_name}",
         f"*Wallet:* `{wallet_address}`",
     ]
+    if requirement_eval.get("wallet_count", 1) > 1:
+        text_lines.append(f"*Registered wallets checked:* {requirement_eval['wallet_count']}")
     if requirement_eval.get("details"):
         text_lines += ["", "📋 *Verification Details:*"] + requirement_eval["details"]
     text_lines += ["", "Your wallet has been registered! You can now participate in group activities.",
@@ -6160,6 +6208,8 @@ def _completed_verification_payload(completed, restart_url):
             'eligibility_status': 'fail',
             'requirements_met': False,
             'restart_url': restart_url,
+            'holdings_progress': holdings_summary.get('progress', {}),
+            'next_verification_session': completed.get('next_verification_session'),
             'replayed': True,
         }, 403)
     if eligibility_status == "pass":
@@ -6543,8 +6593,11 @@ def api_verify():
                 'restart_url': restart_url,
             })), 409
 
+        registration = get_user_registration(group_id, tg_user_id) or {}
+        registered_wallets = canonical_wallets(registration.get('wallets', []))
+        combined_wallets = canonical_wallets(registered_wallets + [wallet_address])
         requirement_eval = evaluate_wallet_requirements(
-            wallet_address,
+            combined_wallets,
             cfg,
             user_id=tg_user_id,
             force_fresh=True,
@@ -6563,6 +6616,8 @@ def api_verify():
             })), 503
 
         holdings_summary = qualifying_holdings_summary(cfg, requirement_eval)
+        holdings_summary['wallet_count'] = len(combined_wallets)
+        holdings_summary['progress'] = verification_holdings_progress(cfg, requirement_eval)
         username = _get_user_display_name(tg_user_id)
         try:
             success = finalize_verified_wallet(
@@ -6575,7 +6630,17 @@ def api_verify():
                 'pass' if requirement_eval['requirements_met'] else 'fail',
                 holdings_summary,
                 claim_id,
+                expected_wallets=registered_wallets,
             )
+        except RegistrationWalletsChanged:
+            return _add_cors_headers(jsonify({
+                'success': False,
+                'error': 'Your registered wallets changed during verification. Please try again to check the updated totals.',
+                'retryable': True,
+                'ownership_verified': True,
+                'wallet_registered': False,
+                'restart_url': restart_url,
+            })), 409
         except psycopg2.IntegrityError:
             return _add_cors_headers(jsonify({
                 'success': False,
@@ -6610,27 +6675,15 @@ def api_verify():
             )
             if requirement_eval.get('details'):
                 error_msg += "\n\n📋 *Current Check Details:*\n" + "\n".join(requirement_eval['details'])
-            error_msg += "\n\n_Your wallet has been saved. You can re-verify at any time._"
+            error_msg += "\n\n_Your wallet has been saved. Use Add another wallet on the verification page to combine holdings._"
             try:
                 bot.send_message(tg_user_id, error_msg, parse_mode='Markdown')
             except Exception as e:
                 logging.debug(f"api_verify: could not send requirement error to user {tg_user_id}: {e}")
-            return _add_cors_headers(jsonify({
-                'success': False,
-                'error': 'Wallet does not meet group requirements',
-                'message': (
-                    'Wallet ownership was verified and the address was '
-                    'registered, but current holdings do not meet this '
-                    'group’s requirements.'
-                ),
-                'details': eval_errors,
-                'retryable': False,
-                'ownership_verified': True,
-                'wallet_registered': True,
-                'eligibility_status': 'fail',
-                'requirements_met': False,
-                'restart_url': restart_url,
-            })), 403
+            completed = get_completed_verification_result(verification_session, wallet_address)
+            payload, status_code = _completed_verification_payload(completed, restart_url)
+            payload['replayed'] = False
+            return _add_cors_headers(jsonify(payload)), status_code
 
         # Send confirmation to user and notify the group
         try:
