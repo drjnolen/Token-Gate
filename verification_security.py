@@ -6,6 +6,18 @@ import re
 _VERIFICATION_SESSION_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 
 
+class RegistrationWalletsChanged(Exception):
+    """The registered wallet set changed while holdings were being checked."""
+
+
+def canonical_wallets(addresses) -> list[str]:
+    """Deduplicate valid stored addresses, including legacy short-form addresses."""
+    return list(dict.fromkeys(
+        canonical for address in addresses
+        if (canonical := canonical_sui_address(address)) is not None
+    ))
+
+
 def is_valid_verification_session_id(value: str) -> bool:
     """Return whether a value can be one of our URL-safe session secrets."""
     return isinstance(value, str) and bool(_VERIFICATION_SESSION_PATTERN.fullmatch(value))

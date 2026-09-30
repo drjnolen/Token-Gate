@@ -42,7 +42,8 @@ class EnforcementRegressionGuards(unittest.TestCase):
         self.assertIn("AND claim_id = %s", finalize)
         self.assertIn("DELETE FROM pending_verifications", finalize)
         self.assertIn("holdings_summary = %s::jsonb", finalize)
-        self.assertNotIn("expires_at > NOW()", finalize)
+        # Expiry gates only the child session, not completion of an active claim.
+        self.assertNotIn("expires_at > NOW()", finalize.split("# One child")[0])
         release = FUNCTIONS["release_verification_session"]
         self.assertIn("AND claim_id = %s", release)
         self.assertIn("attempt_count = attempt_count + CASE", claim)

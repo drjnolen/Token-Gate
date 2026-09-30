@@ -57,6 +57,33 @@ def _format_token_amount(value: Any) -> str | None:
     return grouped + (separator + fraction if separator else "")
 
 
+def verification_holdings_progress(config: Mapping[str, Any], result: Mapping[str, Any]) -> dict:
+    """Plain-text totals and thresholds, persisted for refresh/retry recovery."""
+    parts = []
+    mode = config.get('registration_mode', 'token')
+    if mode in {'token', 'both'} and config.get('token'):
+        balance = _format_token_amount(result.get('token_balance'))
+        minimum = _format_token_amount(config.get('minimum_holding', 0))
+        if balance is not None and minimum is not None:
+            parts.append(f"Tokens: {balance} / {minimum} required")
+    if mode in {'nft', 'both'} and config.get('nft_collection_id'):
+        count = result.get('nft_count')
+        if count is not None:
+            parts.append(f"NFTs: {count:,} / {config.get('nft_threshold', 1):,} required")
+        if config.get('nft_trait_name'):
+            count = result.get('trait_count')
+            parts.append(
+                f"Matching-trait NFTs: {count:,} / {config.get('nft_trait_threshold', 1):,} required"
+                if count is not None else "NFT traits will be checked once the collection minimum is met"
+            )
+    wallet_count = result.get('wallet_count', 1)
+    noun = 'wallet' if wallet_count == 1 else 'wallets'
+    message = f"Combined holdings across {wallet_count} registered {noun}. " + ". ".join(parts)
+    if mode == 'both':
+        message += ". Meet either the token requirement or the NFT requirements."
+    return {'wallet_count': wallet_count, 'message': message}
+
+
 def verification_success_message(summary: Mapping[str, Any] | None) -> str:
     """Build stable success copy from a durable qualifying-holdings summary."""
     summary = summary or {}
@@ -78,4 +105,6 @@ def verification_success_message(summary: Mapping[str, Any] | None) -> str:
         holdings_copy = parts[0]
     else:
         holdings_copy = ", ".join(parts[:-1]) + " and " + parts[-1]
-    return f"{VERIFICATION_SUCCESS_COPY} {holdings_copy} found."
+    wallet_count = summary.get('wallet_count', 1)
+    scope = f" across {wallet_count} registered wallets" if wallet_count > 1 else ''
+    return f"{VERIFICATION_SUCCESS_COPY} {holdings_copy} found{scope}."

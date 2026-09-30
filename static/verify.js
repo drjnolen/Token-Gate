@@ -68,12 +68,14 @@
   const changeButton = document.getElementById('changeButton');
   const reviewPanel = document.getElementById('reviewPanel');
   const contextRecovery = document.getElementById('contextRecovery');
+  const addWalletButton = document.getElementById('addWalletButton');
+  let nextVerificationSession = '';
 
   if (query.has('verification_session') || query.has('api_verify_url')) {
     const cleanUrl = new URL(window.location.href);
     cleanUrl.searchParams.delete('verification_session');
     cleanUrl.searchParams.delete('api_verify_url');
-    if (!serverSession) {
+    if (VERIFICATION_SESSION) {
       const fragment = new URLSearchParams({
         verification_session: VERIFICATION_SESSION
       });
@@ -330,7 +332,6 @@
   }
 
   function scrubSensitiveUrl() {
-    if (serverSession) return;
     const cleanUrl = new URL(window.location.href);
     cleanUrl.searchParams.delete('verification_session');
     cleanUrl.searchParams.delete('api_verify_url');
@@ -341,6 +342,8 @@
   function showResult(result, responseOk) {
     setStep(3);
     document.getElementById('retryButton').hidden = true;
+    addWalletButton.hidden = true;
+    nextVerificationSession = '';
     clearNotice('resultNotice');
     const success = responseOk && result.success;
     const registeredButIneligible = Boolean(
@@ -361,18 +364,29 @@
       return;
     }
     if (registeredButIneligible) {
+      if (/^[A-Za-z0-9_-]{32,128}$/.test(result.next_verification_session || '') &&
+          result.next_verification_session !== VERIFICATION_SESSION) {
+        nextVerificationSession = result.next_verification_session;
+        addWalletButton.hidden = false;
+      }
       document.getElementById('resultIcon').textContent = '⚠️';
       document.getElementById('resultTitle').textContent =
         'Wallet registered — requirements not met';
       document.getElementById('resultMessage').textContent =
-        result.message || 'Ownership was verified, but current holdings are below this group’s requirements.';
+        (result.message || 'Ownership was verified, but current holdings are below this group’s requirements.') +
+        (result.holdings_progress && result.holdings_progress.message
+          ? ' ' + result.holdings_progress.message : '');
       showNotice(
         'resultNotice',
-        'Your wallet was saved. Update your holdings and request a new verification link when ready.',
+        nextVerificationSession
+          ? 'Your wallet was saved. Add another wallet here to combine holdings—no return to Telegram needed. Each wallet needs its own signature. The original verification link expiry still applies.'
+          : 'Your wallet was saved. Request a new verification link to continue; your registered wallets will still count.',
         'warning'
       );
       track('gate_check', { result: 'fail', source: 'wallet_verification' });
-      scrubSensitiveUrl();
+      // Keep the completed session in the fragment while continuation is
+      // available, so refresh can recover the same durable result and child.
+      if (!nextVerificationSession) scrubSensitiveUrl();
       return;
     }
     document.getElementById('resultIcon').textContent = '❌';
@@ -452,6 +466,22 @@
   function requestNewLink() {
     if (restartUrl) window.location.assign(restartUrl);
   }
+
+  addWalletButton.addEventListener('click', () => {
+    if (!nextVerificationSession || submissionInFlight) return;
+    addWalletButton.disabled = true;
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.delete('verification_session');
+    nextUrl.searchParams.delete('api_verify_url');
+    nextUrl.hash = new URLSearchParams({
+      verification_session: nextVerificationSession,
+      api_verify_url: API_VERIFY_URL
+    }).toString();
+    // Reload resets connector/signature state and reopens explicit selection.
+    // replaceState keeps session secrets out of query strings and back history.
+    window.history.replaceState(null, '', nextUrl);
+    window.location.reload();
+  });
 
   signButton.addEventListener('click', async () => {
     clearNotice('walletNotice');
