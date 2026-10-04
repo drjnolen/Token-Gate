@@ -11,6 +11,22 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: token_gate_test
+          POSTGRES_PASSWORD: token_gate_test
+          POSTGRES_DB: token_gate_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U token_gate_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://token_gate_test:token_gate_test@localhost:5432/token_gate_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,7 +35,7 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt pip-audit==2.10.1 ruff==0.12.12
-      - run: python -m compileall -q main.py admin_wallet_flow.py verification_security.py verification_config.py enforcement_policy.py sui_gateway.py runtime_support.py tests
+      - run: python -m compileall -q main.py admin_wallet_flow.py config_input_flow.py removal_safety.py sui_ownership.py wallet_deletion.py verification_security.py verification_config.py enforcement_policy.py sui_gateway.py runtime_support.py tests
       - run: node --check static/verify.js
       - run: node --test tests/verify-flow.test.cjs
       - run: ruff check .

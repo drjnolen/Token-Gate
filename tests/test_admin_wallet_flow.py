@@ -292,7 +292,7 @@ class AdminWalletFlowTests(unittest.TestCase):
         function.decorator_list = []
         flow = Mock()
         namespace = {"bot": self.bot, "group_has_active_subscription": self.subscription,
-                     "_admin_wallet_flow": flow}
+                     "_admin_wallet_flow": flow, "_config_input_flow": Mock()}
         exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
         call = NS(id="callback", from_user=self.owner, message=self.message,
                   data="privconfig_-100_addmemberwallet")
