@@ -267,8 +267,11 @@ class EnforcementRegressionGuards(unittest.TestCase):
         source = FUNCTIONS["check_user_wallets"]
         self.assertIn("decide_auto_removal", source)
         self.assertIn("use_cache=False", source)
-        self.assertIn("unban_chat_member", source)
-        self.assertIn("only_if_banned=True", source)
+        self.assertIn("_safe_removal.remove", source)
+        removal_source = Path("removal_safety.py").read_text(encoding="utf-8")
+        self.assertIn("force_fresh=True", removal_source)
+        self.assertIn("unban_chat_member", removal_source)
+        self.assertIn("only_if_banned=True", removal_source)
 
     def test_vote_weight_failure_is_retryable_and_first_weight_is_immutable(self):
         handler = FUNCTIONS["handle_poll_vote"]
@@ -293,7 +296,7 @@ class EnforcementRegressionGuards(unittest.TestCase):
     def test_alert_cooldown_is_written_only_after_delivery(self):
         source = FUNCTIONS["check_user_wallets"]
         send_index = source.index("if send_low_holdings_alerts_to_admins")
-        insert_index = source.index("INSERT INTO low_balance_alerts")
+        insert_index = source.index("record_delivered_low_balance_alerts")
         self.assertLess(send_index, insert_index)
 
     def test_database_connection_logging_does_not_include_url_user_info(self):

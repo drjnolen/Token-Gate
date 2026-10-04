@@ -28,6 +28,13 @@ from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor
 from waitress import serve as waitress_serve
 from admin_wallet_flow import AdminWalletFlow
+from config_input_flow import ConfigInputFlow
+from wallet_deletion import WalletDeletion, SCHEMA as WALLET_DELETION_SCHEMA
+from removal_safety import RemovalRepository, SafeRemoval, SCHEMA as REMOVAL_SCHEMA
+from sui_ownership import (
+    canonical_move_type, normalize_collection, collection_matches,
+    personal_cap_types, trusted_personal_cap,
+)
 from verification_security import (
     RegistrationWalletsChanged,
     canonical_wallets,
@@ -700,6 +707,8 @@ def init_db():
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cur.execute(REMOVAL_SCHEMA)
+        cur.execute(WALLET_DELETION_SCHEMA)
         # Create indexes for frequently queried columns to optimize performance
         cur.execute("CREATE INDEX IF NOT EXISTS idx_user_wallets_user ON user_wallets(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_voting_polls_group ON voting_polls(group_id)")
@@ -849,6 +858,7 @@ def init_db():
         return True
 
 init_db()
+_wallet_deletion = WalletDeletion(get_db_cursor)
 
 @db_retry
 def load_configs_from_db():
@@ -2104,6 +2114,22 @@ def renew_wallet_scheduler_lease(stop_event, lost_event):
             return
 
 
+def record_delivered_low_balance_alerts(group_id, user_ids):
+    """Persist a cooldown only after Telegram accepts an administrator alert."""
+    user_ids = list(dict.fromkeys(user_ids))
+    if not user_ids:
+        return
+    values = [(group_id, user_id, ALERT_DELIVERY_VERSION) for user_id in user_ids]
+    placeholders = ",".join(["(%s, %s, NOW(), %s)"] * len(values))
+    with get_db_cursor() as (_, cur):
+        cur.execute(f"""
+            INSERT INTO low_balance_alerts (group_id, user_id, alert_sent_at, delivery_version)
+            VALUES {placeholders}
+            ON CONFLICT (group_id, user_id) DO UPDATE SET
+                alert_sent_at = NOW(), delivery_version = EXCLUDED.delivery_version
+        """, [item for row in values for item in row])
+
+
 def check_user_wallets():
     """
     Efficiently checks all user wallets for a group in a single batch operation
@@ -2130,8 +2156,7 @@ def check_user_wallets():
                 daemon=True,
             ).start()
 
-            with config_lock:
-                configs = {group_id: dict(cfg) for group_id, cfg in SUBSCRIBER_CONFIGS.items()}
+            configs = load_configs_from_db()
             scan_started_monotonic = time.monotonic()
             with _wallet_scan_state_lock:
                 _wallet_scan_state.update({
@@ -2219,9 +2244,6 @@ def check_user_wallets():
                     for wallet in reg["wallets"]:
                         all_wallets_to_check.add(wallet.lower())
 
-                if not all_wallets_to_check:
-                    continue
-
                 # 3. Make batched API calls for the entire group
                 logging.info(f"Starting batch balance check for {len(all_wallets_to_check)} unique wallets in group {group_id}.")
                 
@@ -2249,7 +2271,7 @@ def check_user_wallets():
                         break
                     user_id = reg["user_id"]
 
-                    if reg["is_exempt"] or not reg["wallets"]:
+                    if reg["is_exempt"]:
                         continue
 
                     user_wallets_lower = [w.lower() for w in reg["wallets"]]
@@ -2265,7 +2287,7 @@ def check_user_wallets():
                             token_indeterminate = True
                         else:
                             total_balance = sum(v for v in wallet_values if v is not None)
-                            token_valid = total_balance >= minimum_holding
+                            token_valid = bool(user_wallets_lower) and total_balance >= minimum_holding
                     
                     # Check NFT holdings (collection + optional traits)
                     nft_valid = False
@@ -2507,108 +2529,25 @@ def check_user_wallets():
                                     )
                                 continue
 
-                            fresh_balances = fetch_wallet_balances(
-                                user_wallets_lower,
-                                token,
-                                decimals,
-                                use_cache=False,
-                                deadline_monotonic=(
-                                    time.monotonic()
-                                    + SUI_OPERATION_TIMEOUT_SECONDS
-                                ),
+                            outcome = _safe_removal.remove(
+                                group_id, user_id, config, reg["wallets"], scan_lease_lost,
                             )
-                            fresh_values = [
-                                fresh_balances.get(wallet)
-                                for wallet in user_wallets_lower
-                            ]
-                            if any(value is None for value in fresh_values):
-                                record_enforcement_event(
-                                    group_id,
-                                    user_id,
-                                    "auto_remove",
-                                    "deferred",
-                                    {"reason": "final_recheck_unavailable"},
-                                )
-                                continue
-
-                            fresh_total = sum(
-                                fresh_values,
-                                Decimal(0),
+                            record_enforcement_event(
+                                group_id, user_id, "auto_remove", outcome, {},
                             )
-                            if fresh_total >= minimum_holding:
+                            if outcome == "recovered":
                                 clear_enforcement_state(group_id, user_id)
                                 valid_user_ids.append(user_id)
-                                record_enforcement_event(
-                                    group_id,
-                                    user_id,
-                                    "auto_remove",
-                                    "recovered",
-                                    {"balance": str(fresh_total)},
-                                )
-                                continue
-
-                            try:
-                                bot.ban_chat_member(group_id, user_id)
-                                bot.unban_chat_member(
-                                    group_id,
-                                    user_id,
-                                    only_if_banned=True,
-                                )
+                            elif outcome == "removed":
                                 try:
                                     bot.send_message(
                                         user_id,
-                                        "⚠️ You were removed from the group after "
-                                        "the balance grace period expired.\n\n"
-                                        f"Current: {fresh_total:,.2f}\n"
-                                        f"Required: {minimum_holding:,.2f}\n\n"
-                                        "You are not banned. Once your balance meets "
-                                        "the requirement, you can re-register and rejoin.",
+                                        "⚠️ You were removed after the holdings grace period expired.\n\n"
+                                        "You are not banned. Once your holdings meet the requirement, "
+                                        "you can re-register and rejoin.",
                                     )
-                                except Exception as dm_e:
-                                    logging.debug(
-                                        f"Could not DM user {user_id} after "
-                                        f"removal: {dm_e}"
-                                    )
-                                with get_db_cursor() as (conn, cur):
-                                    cur.execute(
-                                        "DELETE FROM user_wallets "
-                                        "WHERE group_id = %s AND user_id = %s",
-                                        (group_id, user_id),
-                                    )
-                                    cur.execute(
-                                        "DELETE FROM low_balance_alerts "
-                                        "WHERE group_id = %s AND user_id = %s",
-                                        (group_id, user_id),
-                                    )
-                                    cur.execute(
-                                        "DELETE FROM enforcement_states "
-                                        "WHERE group_id = %s AND user_id = %s",
-                                        (group_id, user_id),
-                                    )
-                                record_enforcement_event(
-                                    group_id,
-                                    user_id,
-                                    "auto_remove",
-                                    "removed",
-                                    {"balance": str(fresh_total)},
-                                )
-                                logging.info(
-                                    f"Removed and unbanned user {user_id} from "
-                                    f"group {group_id} for holdings of "
-                                    f"{fresh_total:,.2f} tokens."
-                                )
-                            except Exception as e:
-                                record_enforcement_event(
-                                    group_id,
-                                    user_id,
-                                    "auto_remove",
-                                    "failed",
-                                    {"error": type(e).__name__},
-                                )
-                                logging.error(
-                                    f"Error removing user {user_id} from "
-                                    f"group {group_id}: {e}"
-                                )
+                                except Exception:
+                                    logging.debug("Could not deliver removal notice to %s", user_id)
                             continue
 
                         # Check if user is in alert cooldown period
@@ -2688,22 +2627,9 @@ def check_user_wallets():
                     # suppressed for the cooldown window.
                     if send_low_holdings_alerts_to_admins(group_id, alert_entries):
                         try:
-                            with get_db_cursor() as (conn, cur):
-                                # Single batch INSERT with all users instead of N individual queries
-                                values_list = [
-                                    (group_id, user_id, ALERT_DELIVERY_VERSION)
-                                    for user_id, _ in below_users_to_alert
-                                ]
-                                placeholders = ",".join([f"(%s, %s, %s)"] * len(values_list))
-                                flat_values = [item for pair in values_list for item in pair]
-                                cur.execute(f"""
-                                    INSERT INTO low_balance_alerts (group_id, user_id, alert_sent_at, delivery_version)
-                                    VALUES {placeholders}
-                                    ON CONFLICT (group_id, user_id) DO UPDATE SET
-                                        alert_sent_at = NOW(),
-                                        delivery_version = EXCLUDED.delivery_version
-                                """, flat_values)
-                                logging.info(f"Batch inserted {len(below_users_to_alert)} low balance alerts for group {group_id}")
+                            record_delivered_low_balance_alerts(
+                                group_id, [user_id for user_id, _ in below_users_to_alert],
+                            )
                         except Exception as e:
                             # A later duplicate is preferable to claiming an
                             # alert was delivered when its cooldown was never
@@ -2806,6 +2732,8 @@ _admin_wallet_flow = AdminWalletFlow(
     wallet_taken=wallet_already_registered, save_wallet=_save_admin_selected_wallet,
 )
 _admin_wallet_flow.register()
+_config_input_flow = ConfigInputFlow(bot, subscription_active=group_has_active_subscription)
+_config_input_flow.register_handlers()
 
 
 @bot.message_handler(
@@ -2960,6 +2888,8 @@ def status_command(message):
                 (group_id,),
             )
             last_event = cur.fetchone()
+            cur.execute("SELECT COUNT(*) FROM removal_recovery WHERE group_id = %s", (group_id,))
+            pending_unbans = cur.fetchone()[0]
 
         with _wallet_scan_state_lock:
             scan_state = dict(_wallet_scan_state)
@@ -2999,6 +2929,7 @@ def status_command(message):
             f"(started {scan_started_text})\n"
             f"Active verification sessions: {active_sessions}\n"
             f"Members in auto-remove grace: {grace_members}\n"
+            f"Pending removal recovery: {pending_unbans}\n"
             f"Last enforcement event: {last_event_text}\n\n"
             "Sui GraphQL providers\n"
             + "\n".join(provider_lines)
@@ -3217,6 +3148,9 @@ def handle_private_config_callback(call):
             return
 
         user_id = call.from_user.id
+        if call.message.chat.type != "private" or call.message.chat.id != user_id:
+            bot.answer_callback_query(call.id, "Open /cwconfig in private chat.")
+            return
 
         # Check for admin status again for security (for config actions)
         if call.data.startswith("privconfig_") or call.data.startswith("config_") or call.data.startswith("privvote_"):
@@ -3250,14 +3184,15 @@ def handle_private_config_callback(call):
         # --- THE REST OF THE FUNCTION LOGIC REMAINS THE SAME ---
         # (This combines the logic from the deleted function with the new one)
 
+        _config_input_flow.abandon(user_id)
         if action == "addmemberwallet":
             _admin_wallet_flow.start(call.message, user_id, group_id)
             return
         _admin_wallet_flow.abandon(user_id)
 
         if action == "settokenconfig":
-            msg = bot.send_message(call.message.chat.id, "Please provide the token address, minimum holding, and decimals, separated by spaces:", reply_markup=types.ForceReply(selective=True))
-            bot.register_next_step_handler(msg, process_set_token_config, group_id)
+            msg = bot.send_message(call.message.chat.id, "Reply to this prompt within 15 minutes with the token address, minimum holding, and decimals, separated by spaces. Send /cancel to stop:", reply_markup=types.ForceReply(selective=True))
+            _config_input_flow.expect(msg, process_set_token_config, group_id)
         elif action == "toggleautoremove":
             with config_lock:
                 config = ensure_config_exists(group_id)
@@ -3275,7 +3210,7 @@ def handle_private_config_callback(call):
                 "recheck on the next scan.",
                 reply_markup=types.ForceReply(selective=True),
             )
-            bot.register_next_step_handler(
+            _config_input_flow.expect(
                 msg,
                 process_set_auto_remove_grace,
                 group_id,
@@ -3304,11 +3239,11 @@ def handle_private_config_callback(call):
             bot.delete_message(call.message.chat.id, call.message.message_id)
             display_exemption_manager(group_id, call.message.chat.id)
         elif action == "setnftcollection":
-            msg = bot.send_message(call.message.chat.id, "Please enter the new NFT collection ID:", reply_markup=types.ForceReply(selective=True))
-            bot.register_next_step_handler(msg, process_set_nft_collection, group_id)
+            msg = bot.send_message(call.message.chat.id, "Reply with the full NFT type (0xPACKAGE::module::Type) or package address. This prompt expires in 15 minutes; /cancel to stop:", reply_markup=types.ForceReply(selective=True))
+            _config_input_flow.expect(msg, process_set_nft_collection, group_id)
         elif action == "setnftthreshold":
             msg = bot.send_message(call.message.chat.id, "Please enter the new NFT threshold (e.g., 1):", reply_markup=types.ForceReply(selective=True))
-            bot.register_next_step_handler(msg, process_set_nft_threshold, group_id)
+            _config_input_flow.expect(msg, process_set_nft_threshold, group_id)
         elif action == "setregmode":
             markup = types.InlineKeyboardMarkup()
             # IMPORTANT: Ensure new buttons use the 'privconfig_' prefix
@@ -3330,16 +3265,16 @@ def handle_private_config_callback(call):
         # --- Voting Actions Now Handled Here ---
         elif action == "setvotespernft":
             msg = bot.send_message(call.message.chat.id, "Enter votes per NFT:", reply_markup=types.ForceReply(selective=True))
-            bot.register_next_step_handler(msg, process_set_votes_per_nft, group_id)
+            _config_input_flow.expect(msg, process_set_votes_per_nft, group_id)
         elif action == "setvotespermillion":
             msg = bot.send_message(call.message.chat.id, "Enter votes per 1M tokens:", reply_markup=types.ForceReply(selective=True))
-            bot.register_next_step_handler(msg, process_set_votes_per_million, group_id)
+            _config_input_flow.expect(msg, process_set_votes_per_million, group_id)
         elif action == "setvoteduration":
             msg = bot.send_message(call.message.chat.id, "Enter vote duration in hours:", reply_markup=types.ForceReply(selective=True))
-            bot.register_next_step_handler(msg, process_set_vote_duration, group_id)
+            _config_input_flow.expect(msg, process_set_vote_duration, group_id)
         elif action == "setvotesperexempt":
             msg = bot.send_message(call.message.chat.id, "Enter votes for exempt users:", reply_markup=types.ForceReply(selective=True))
-            bot.register_next_step_handler(msg, process_set_votes_per_exempt, group_id)
+            _config_input_flow.expect(msg, process_set_votes_per_exempt, group_id)
         elif action == "settraitgate":
             with config_lock:
                 current_config = ensure_config_exists(group_id)
@@ -3371,7 +3306,7 @@ def handle_private_config_callback(call):
                 reply_markup=types.ForceReply(selective=True),
                 parse_mode="Markdown"
             )
-            bot.register_next_step_handler(msg, process_set_trait_name, group_id)
+            _config_input_flow.expect(msg, process_set_trait_name, group_id)
         elif action == "settraitvalue":
             msg = bot.send_message(
                 call.message.chat.id, 
@@ -3380,14 +3315,14 @@ def handle_private_config_callback(call):
                 reply_markup=types.ForceReply(selective=True),
                 parse_mode="Markdown"
             )
-            bot.register_next_step_handler(msg, process_set_trait_value, group_id)
+            _config_input_flow.expect(msg, process_set_trait_value, group_id)
         elif action == "settraitthreshold":
             msg = bot.send_message(
                 call.message.chat.id, 
                 "Enter the minimum number of NFTs with this trait required (e.g., 1):",
                 reply_markup=types.ForceReply(selective=True)
             )
-            bot.register_next_step_handler(msg, process_set_trait_threshold, group_id)
+            _config_input_flow.expect(msg, process_set_trait_threshold, group_id)
         elif action == "cleartraitgate":
             with config_lock:
                 if group_id in SUBSCRIBER_CONFIGS:
@@ -3419,39 +3354,33 @@ def handle_mywallets_callback(call):
 
         bot.answer_callback_query(call.id)
 
-        if action == "dodelete" and len(parts) == 4:
-            try:
-                wallet_idx = int(parts[3])
-            except (ValueError, TypeError):
-                bot.answer_callback_query(call.id, "❌ Invalid wallet selection.")
+        if call.message.chat.type != "private" or call.message.chat.id != user_id:
+            bot.send_message(user_id, "Manage your wallets in private chat with /mywallets.")
+            return
+
+        if action == "dodelete":
+            bot.send_message(user_id, "That wallet menu is outdated. Reopen /mywallets to select the wallet.")
+        elif action == "del" and len(parts) == 4:
+            wallet = _wallet_deletion.lookup(group_id, user_id, parts[3])
+            if not wallet:
+                bot.send_message(user_id, "That wallet action expired. Reopen /mywallets.")
                 return
-            user_reg = get_user_registration(group_id, user_id)
-            current_wallets = user_reg.get("wallets", []) if user_reg else []
-            is_exempt = user_reg.get("is_exempt", False) if user_reg else False
-
-            if wallet_idx < 0 or wallet_idx >= len(current_wallets):
-                bot.answer_callback_query(call.id, "❌ Wallet not found.")
-                return
-
-            wallet_to_remove = current_wallets[wallet_idx]
-            # Case-insensitive removal
-            updated_wallets = [w for w in current_wallets if w.lower() != wallet_to_remove.lower()]
-
-            with config_lock:
-                cfg = SUBSCRIBER_CONFIGS.get(group_id)
-                reg_type = cfg.get("registration_mode", "token") if cfg else "token"
-            save_wallet_for_user(
-                group_id, 
-                user_id, 
-                call.from_user.username or call.from_user.first_name, 
-                updated_wallets, 
-                is_exempt=is_exempt,
-                replace_existing=True, 
-                registration_type=reg_type
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton(
+                "Confirm removal", callback_data=f"mywallet_{group_id}_confirm_{parts[3]}"))
+            markup.add(types.InlineKeyboardButton("Cancel", callback_data=f"mywallet_{group_id}_back"))
+            bot.edit_message_text(
+                f"Remove this registered wallet?\n\n{wallet}\n\n"
+                "Removing your last wallet does not exempt you from the group's holdings requirements. "
+                "You may lose access after the grace period. This confirmation expires in 15 minutes.",
+                chat_id=user_id, message_id=call.message.message_id, reply_markup=markup,
             )
-            bot.send_message(call.message.chat.id, "✅ Wallet removed successfully.")
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-            show_mywallets_private(call.message.chat.id, group_id)
+        elif action == "confirm" and len(parts) == 4:
+            removed = _wallet_deletion.remove(group_id, user_id, parts[3])
+            bot.send_message(user_id, "✅ Wallet removed." if removed else
+                             "That wallet action expired or was already used. Your other wallets are unchanged.")
+            bot.delete_message(user_id, call.message.message_id)
+            show_mywallets_private(user_id, group_id)
 
         elif action == "back":
             bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -3814,7 +3743,7 @@ def show_mywallets_private(chat_id, group_id):
             ]
 
             total_balance = 0
-            for i, wallet in enumerate(wallets):
+            for wallet, action_token in _wallet_deletion.create(group_id, chat_id, wallets):
                 # Truncate wallet address for display
                 display_wallet = f"{wallet[:8]}...{wallet[-6:]}"
 
@@ -3857,9 +3786,9 @@ def show_mywallets_private(chat_id, group_id):
             markup = types.InlineKeyboardMarkup()
 
             # Add inline delete buttons for each individual wallet
-            for i, wallet in enumerate(wallets):
+            for wallet, action_token in _wallet_deletion.create(group_id, chat_id, wallets):
                 display_wallet = f"{wallet[:8]}...{wallet[-6:]}"
-                callback_data = f"mywallet_{group_id}_dodelete_{i}"
+                callback_data = f"mywallet_{group_id}_del_{action_token}"
                 markup.add(types.InlineKeyboardButton(f"🗑️ Remove {display_wallet}", callback_data=callback_data))
 
             # Add/Verify Wallet button pointing to the website-gated flow
@@ -4222,7 +4151,7 @@ def process_set_token_config(message, group_id):
             raise ValueError("threshold must be a finite non-negative number")
         if decimals < 0 or decimals > 18:
             raise ValueError("decimals out of range")
-    except (ValueError, OverflowError):
+    except (InvalidOperation, ValueError, OverflowError):
         bot.send_message(message.chat.id, "❌ Threshold must be a finite non-negative number and decimals must be between 0 and 18.")
         return
 
@@ -4267,7 +4196,13 @@ def process_set_auto_remove_grace(message, group_id):
 
 
 def process_set_nft_collection(message, group_id):
-    collection_id = message.text.strip()
+    try:
+        collection_id = _normalize_collection_id(message.text.strip())
+        if not collection_id:
+            raise ValueError("Missing collection")
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Enter a package address or a full 0xPACKAGE::module::Type. Partial names are not supported.")
+        return
     with config_lock:
         ensure_config_exists(group_id)
         SUBSCRIBER_CONFIGS[group_id]['nft_collection_id'] = collection_id
@@ -4679,37 +4614,8 @@ def calculate_user_vote_weight(group_id, user_id):
     return total_weight, snapshot
 
 def _normalize_collection_id(raw_id: str) -> str:
-    """Normalise a collection identifier to a canonical on-chain form.
-
-    Accepted inputs
-    ---------------
-    * Full SUI type string   ``0xPACKAGE::module::Struct``  → address portion
-      lowercased / zero-padded for canonical Sui matching.
-    * SUI hex address         ``0xABCD…``                   → lowercased,
-      zero-padded to 64 hex characters.
-    """
-    cid = (raw_id or "").strip()
-    if not cid:
-        return ""
-
-    # Full type string – normalise the address portion (before first ::)
-    if "::" in cid:
-        addr_part, rest = cid.split("::", 1)
-        addr_part = addr_part.strip()
-        if addr_part.startswith("0x") or addr_part.startswith("0X"):
-            hex_part = addr_part[2:]
-            if hex_part and all(c in "0123456789abcdefABCDEF" for c in hex_part):
-                addr_part = "0x" + hex_part.lower().zfill(64)
-        return addr_part + "::" + rest
-
-    # Plain hex address
-    if cid.startswith("0x") or cid.startswith("0X"):
-        hex_part = cid[2:]
-        if hex_part and all(c in "0123456789abcdefABCDEF" for c in hex_part):
-            return "0x" + hex_part.lower().zfill(64)
-
-    # Fallback: return as-is (will be used for substring matching)
-    return cid
+    """Require a canonical full Move type or package address."""
+    return normalize_collection(raw_id)
 
 
 def _graphql_type_filter(collection_id: str) -> str | None:
@@ -4731,12 +4637,8 @@ _KIOSK_OWNER_CAP_TYPE = (
     "::kiosk::KioskOwnerCap"
 )
 
-# Suffix used to detect Personal Kiosk Caps, which wrap a KioskOwnerCap
-# inside a soulbound object.  The package address varies across deployments
-# (Mysten's official extension, OriginByte's ob_kiosk, etc.), so we match
-# by suffix rather than exact type to stay robust against upgrades.
-_PERSONAL_KIOSK_CAP_SUFFIX = "::personal_kiosk::PersonalKioskCap"
-
+_PERSONAL_KIOSK_CAP_TYPES = personal_cap_types(os.getenv("SUI_PERSONAL_KIOSK_CAP_TYPES", ""))
+_KIOSK_ITEM_TYPE = canonical_move_type("0x2::kiosk::Item")
 
 def _extract_kiosk_id_from_personal_cap(obj: dict) -> str | None:
     """Extract the Kiosk object ID from a ``PersonalKioskCap`` object.
@@ -4768,7 +4670,7 @@ def _extract_kiosk_id_from_personal_cap(obj: dict) -> str | None:
 
     # Option<KioskOwnerCap> (OriginByte style) – unwrap the vector
     vec = cap_fields.get("vec")
-    if isinstance(vec, list) and len(vec) > 0:
+    if isinstance(vec, list) and len(vec) == 1:
         inner = vec[0]
         if isinstance(inner, dict):
             inner_fields = inner.get("fields") or inner
@@ -4776,23 +4678,7 @@ def _extract_kiosk_id_from_personal_cap(obj: dict) -> str | None:
             if kiosk_id:
                 return kiosk_id
 
-    # GraphQL returns Move JSON without the JSON-RPC ``fields`` wrappers.
-    def find_for(value):
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                if key == "for" and isinstance(nested, str):
-                    return nested
-                result = find_for(nested)
-                if result:
-                    return result
-        elif isinstance(value, list):
-            for nested in value:
-                result = find_for(nested)
-                if result:
-                    return result
-        return None
-
-    return find_for(cap_fields)
+    return None
 
 
 def _fetch_personal_kiosk_ids(owner: str, *, deadline_monotonic=None) -> list[str]:
@@ -4804,7 +4690,7 @@ def _fetch_personal_kiosk_ids(owner: str, *, deadline_monotonic=None) -> list[st
         max_items=SUI_MAX_OBJECTS,
         deadline_monotonic=deadline_monotonic,
     ):
-        if (obj.get("type") or "").endswith(_PERSONAL_KIOSK_CAP_SUFFIX):
+        if trusted_personal_cap(obj.get("type"), _PERSONAL_KIOSK_CAP_TYPES):
             kiosk_id = _extract_kiosk_id_from_personal_cap(obj)
             if kiosk_id:
                 kiosk_ids.append(kiosk_id)
@@ -4817,8 +4703,6 @@ def _fetch_kiosk_nfts(addresses, collection_id, *, deadline_monotonic=None):
     if not normalized:
         return []
 
-    hint_lower = normalized.lower()
-
     results = []
     for owner in [a.lower() for a in addresses if a]:
         kiosk_ids = []
@@ -4830,6 +4714,8 @@ def _fetch_kiosk_nfts(addresses, collection_id, *, deadline_monotonic=None):
             max_items=SUI_MAX_OBJECTS,
             deadline_monotonic=deadline_monotonic,
         ):
+            if not trusted_personal_cap(obj.get("type"), {_KIOSK_OWNER_CAP_TYPE}):
+                continue
             fields = (obj.get("content") or {}).get("fields") or {}
             kiosk_id = fields.get("for")
             if kiosk_id and kiosk_id not in seen_kiosk_ids:
@@ -4852,14 +4738,14 @@ def _fetch_kiosk_nfts(addresses, collection_id, *, deadline_monotonic=None):
                 deadline_monotonic=deadline_monotonic,
             ):
                 name_info = field.get("name") or {}
-                name_type = ((name_info.get("type") or {}).get("repr") or "").lower()
-                if "kiosk::item" not in name_type:
+                name_type = (name_info.get("type") or {}).get("repr") or ""
+                if not trusted_personal_cap(name_type, {_KIOSK_ITEM_TYPE}):
                     continue
                 value = field.get("value") or {}
                 contents = value.get("contents") or {}
                 type_info = contents.get("type") or value.get("type") or {}
-                object_type = (type_info.get("repr") or "").lower()
-                if not object_type or hint_lower not in object_type:
+                object_type = type_info.get("repr") or ""
+                if not collection_matches(object_type, normalized):
                     continue
                 nft_entry = {
                     "objectId": value.get("address") or "",
@@ -4889,25 +4775,8 @@ def _fetch_owned_nfts(addresses, collection_id, *, deadline_monotonic=None):
     normalized = _normalize_collection_id(collection_id)
     type_filter = _graphql_type_filter(normalized)
 
-    # Fallback client-side matching when no GraphQL type filter is available
-    hint_lower = normalized.lower() if normalized else ""
-
     def matches(obj):
-        otype = (obj.get("type") or "").lower()
-        oid = (obj.get("objectId") or "").lower()
-        if not otype or "::" not in otype:
-            return False
-        if "coin::" in otype:
-            return False
-        if not hint_lower:
-            return True
-        if hint_lower == oid:
-            return True
-        if otype.startswith(hint_lower + "::"):
-            return True
-        if "::" in hint_lower and otype.startswith(hint_lower):
-            return True
-        return hint_lower in otype
+        return collection_matches(obj.get("type"), normalized)
 
     results = []
     seen_ids = set()
@@ -4960,7 +4829,7 @@ def get_user_nft_count(
     """
     current_time = time.time()
     normalized_addresses = [addr.lower() for addr in addresses if addr]
-    collection_hint = _normalize_collection_id(collection_id).lower()
+    collection_hint = (collection_id or "").strip()
     cache_key = (tuple(sorted(normalized_addresses)), collection_hint)
 
     effective_cache_ttl = NFT_CACHE_TTL if cache_ttl is None else cache_ttl
@@ -5086,7 +4955,7 @@ def get_user_nft_trait_count(
     *trait_name* equals *trait_value*.  Returns ``None`` on error."""
     current_time = time.time()
     normalized_addresses = [addr.lower() for addr in wallet_addresses if addr]
-    collection_hint = _normalize_collection_id(collection_id).lower()
+    collection_hint = (collection_id or "").strip()
     cache_key = (tuple(sorted(normalized_addresses)), collection_hint)
     effective_cache_ttl = NFT_CACHE_TTL if cache_ttl is None else cache_ttl
 
@@ -5140,7 +5009,7 @@ def get_user_nft_category_count(
     any value for *trait_name*.  Returns ``None`` on error."""
     current_time = time.time()
     normalized_addresses = [addr.lower() for addr in wallet_addresses if addr]
-    collection_hint = _normalize_collection_id(collection_id).lower()
+    collection_hint = (collection_id or "").strip()
     cache_key = (tuple(sorted(normalized_addresses)), collection_hint)
     effective_cache_ttl = NFT_CACHE_TTL if cache_ttl is None else cache_ttl
 
@@ -5351,6 +5220,16 @@ def evaluate_wallet_requirements(
         "token_balance": token_balance,
         "wallet_count": len(wallets),
     }
+
+_removal_repository = RemovalRepository(
+    get_db_cursor, instance_id=SCHEDULER_INSTANCE_ID, whitelisted=is_group_whitelisted,
+)
+_safe_removal = SafeRemoval(
+    _removal_repository, bot, evaluate=evaluate_wallet_requirements,
+    event=record_enforcement_event,
+)
+_removal_recovery_stop = threading.Event()
+
 
 @db_retry
 def update_poll_display(message, poll_id, title, options):
@@ -7053,6 +6932,11 @@ if __name__ == "__main__":
 
             time.sleep(60)
 
+    recovery_thread = threading.Thread(
+        target=_safe_removal.run_recovery, args=(_removal_recovery_stop,),
+        name="removal-recovery", daemon=True,
+    )
+    recovery_thread.start()
     keepalive_thread = threading.Thread(target=keep_alive)
     keepalive_thread.daemon = True
     keepalive_thread.start()
@@ -7216,6 +7100,7 @@ if __name__ == "__main__":
             time.sleep(60)
     except KeyboardInterrupt:
         print("Application shutting down...")
+        _removal_recovery_stop.set()
         bot.stop_polling()
         _delayed_tasks.close()
         _background_executor.shutdown(wait=False, cancel_futures=True)

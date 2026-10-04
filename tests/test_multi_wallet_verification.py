@@ -16,6 +16,7 @@ from flask import Flask, jsonify, request
 import psycopg2
 
 from enforcement_policy import evaluate_gate
+from sui_ownership import collection_matches
 from verification_security import (
     RegistrationWalletsChanged, build_wallet_ownership_message,
     canonical_sui_address, canonical_wallets, is_valid_verification_session_id,
@@ -190,6 +191,7 @@ class NftDeduplicationTests(unittest.TestCase):
         gateway.iter_owned_objects.return_value = [nft]
         ns = load('_fetch_owned_nfts', _normalize_collection_id=lambda value: value,
                   _graphql_type_filter=lambda value: value, sui_gateway=gateway,
+                  collection_matches=collection_matches,
                   SUI_MAX_PAGES=10, SUI_MAX_OBJECTS=100,
                   _fetch_kiosk_nfts=Mock(return_value=[nft]))
         self.assertEqual(ns['_fetch_owned_nfts']([A, B], '0x1::nft::NFT'), [nft])
