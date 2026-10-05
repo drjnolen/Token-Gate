@@ -31,9 +31,31 @@ class VerificationUrlTests(unittest.TestCase):
             parse_qs(parsed.fragment),
             {
                 "verification_session": ["a" * 43],
-                "api_verify_url": [f"{DEFAULT_PUBLIC_API_BASE_URL}/api/verify"],
             },
         )
+
+    def test_alternate_backends_keep_explicit_routing(self):
+        for endpoint in ("https://token-gate-bot.onrender.com/api/verify",
+                         "http://localhost:8080/api/verify", "http://127.0.0.1:8000/api/verify"):
+            with self.subTest(endpoint=endpoint):
+                url = build_hosted_verification_url(DEFAULT_WALLET_CONNECT_URL, "a" * 43, endpoint)
+                self.assertEqual(parse_qs(urlsplit(url).fragment), {
+                    "verification_session": ["a" * 43], "api_verify_url": [endpoint],
+                })
+
+    def test_default_endpoint_is_validated_and_canonicalized_before_omission(self):
+        url = build_hosted_verification_url(DEFAULT_WALLET_CONNECT_URL, "a" * 43,
+                                          f"{DEFAULT_PUBLIC_API_BASE_URL}:443/api/verify/")
+        self.assertNotIn("api_verify_url", url)
+        for endpoint in ("https://evil.example/api/verify", f"{DEFAULT_PUBLIC_API_BASE_URL}/wrong",
+                         f"{DEFAULT_PUBLIC_API_BASE_URL}/api/verify?extra=1"):
+            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                build_hosted_verification_url(DEFAULT_WALLET_CONNECT_URL, "a" * 43, endpoint)
+
+    def test_browser_and_link_builder_share_the_default_service(self):
+        browser = Path("static/verify.js").read_text(encoding="utf-8")
+        match = re.search(r"const DEFAULT_API_VERIFY_URL =\s*'([^']+)'", browser)
+        self.assertEqual(match.group(1), f"{DEFAULT_PUBLIC_API_BASE_URL}/api/verify")
 
     def test_invalid_or_credentialed_page_urls_fail_closed(self):
         invalid = (
