@@ -83,15 +83,20 @@ def build_hosted_verification_url(
     verification_session: str,
     api_verify_url: str,
 ) -> str:
-    """Put the single-use session and API endpoint in a URL fragment."""
+    """Use a session-only fragment for the hosted page's default backend.
+
+    Keep explicit routing for alternate deployments and local development;
+    those sessions belong to a different database and cannot use the default.
+    """
     if not is_valid_verification_session_id(verification_session):
         raise ValueError("verification_session is invalid")
     parsed = urlsplit(page_url)
     api_url = normalize_api_verify_url(api_verify_url)
     fragment_values = {
         "verification_session": verification_session,
-        "api_verify_url": api_url,
     }
+    if api_url != f"{DEFAULT_PUBLIC_API_BASE_URL}/api/verify":
+        fragment_values["api_verify_url"] = api_url
     return urlunsplit(
         (
             parsed.scheme,

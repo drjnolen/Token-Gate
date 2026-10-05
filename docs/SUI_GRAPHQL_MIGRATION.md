@@ -85,6 +85,11 @@ fragment, so it is not sent to the static host or CDN. The page converts legacy
 query-string links into fragments immediately and removes the fragment after a
 terminal result.
 
+Production links now contain only `#verification_session=<token>`: the page
+already knows the default backend. Valid legacy links with `api_verify_url`
+continue working, and alternate backends/local development retain explicit
+routing. See [the simplified-link rollout notes](SIMPLIFIED_VERIFICATION_LINKS.md).
+
 ## Enforcement and voting safety
 
 - Auto-removal begins with a configurable grace period.

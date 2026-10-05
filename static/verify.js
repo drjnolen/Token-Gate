@@ -71,16 +71,31 @@
   const addWalletButton = document.getElementById('addWalletButton');
   let nextVerificationSession = '';
 
+  function sessionFragment(session) {
+    const fragment = new URLSearchParams({ verification_session: session });
+    // The static page already knows its default service. Preserve alternate
+    // backend routing across reloads without repeating the production URL.
+    if (API_VERIFY_URL && API_VERIFY_URL !== DEFAULT_API_VERIFY_URL) {
+      fragment.set('api_verify_url', API_VERIFY_URL);
+    }
+    return fragment.toString();
+  }
+
   if (query.has('verification_session') || query.has('api_verify_url')) {
     const cleanUrl = new URL(window.location.href);
     cleanUrl.searchParams.delete('verification_session');
     cleanUrl.searchParams.delete('api_verify_url');
     if (VERIFICATION_SESSION) {
-      const fragment = new URLSearchParams({
-        verification_session: VERIFICATION_SESSION
-      });
-      if (API_VERIFY_URL) fragment.set('api_verify_url', API_VERIFY_URL);
-      cleanUrl.hash = fragment.toString();
+      // Do not silently repair a rejected endpoint by dropping it: preserve
+      // it in the fragment so a reload also fails closed.
+      if (apiConfigurationError) {
+        cleanUrl.hash = new URLSearchParams({
+          verification_session: VERIFICATION_SESSION,
+          api_verify_url: requestedApiValue
+        }).toString();
+      } else {
+        cleanUrl.hash = sessionFragment(VERIFICATION_SESSION);
+      }
     }
     window.history.replaceState(null, '', cleanUrl);
   }
@@ -473,10 +488,7 @@
     const nextUrl = new URL(window.location.href);
     nextUrl.searchParams.delete('verification_session');
     nextUrl.searchParams.delete('api_verify_url');
-    nextUrl.hash = new URLSearchParams({
-      verification_session: nextVerificationSession,
-      api_verify_url: API_VERIFY_URL
-    }).toString();
+    nextUrl.hash = sessionFragment(nextVerificationSession);
     // Reload resets connector/signature state and reopens explicit selection.
     // replaceState keeps session secrets out of query strings and back history.
     window.history.replaceState(null, '', nextUrl);
